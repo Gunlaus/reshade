@@ -164,6 +164,17 @@ impl Cache {
         Ok(bytes)
     }
 
+    #[cfg(all(test, windows))]
+    pub(crate) fn fixture(&self, url: &str, bytes: &[u8]) -> Result<()> {
+        let _lock = self.lock()?;
+        let mut index: Receipts = read_json(&self.index())?;
+        let digest = sha256(bytes);
+        let entry = Cached { digest, version: "fixture".into(), url: url.into(), size: bytes.len() as u64 };
+        atomic_write(&self.file(&entry.digest)?, bytes)?;
+        index.0.insert(url.into(), entry);
+        write_json(&self.index(), &index)
+    }
+
     pub fn contains(&self, url: &str) -> bool {
         self.status(url).is_some()
     }
@@ -184,9 +195,9 @@ impl Cache {
                 return Ok((entry.clone(), bytes));
             }
         }
-        let (resolved, version) = if shader {
+        let (resolved, version, expected_digest) = if shader {
             match resolve_shader(client, url) {
-                Ok(value) => value,
+                Ok((url, version)) => (url, version, None),
                 Err(error) => {
                     if let Some((entry, bytes)) = current.and_then(|e| self.verify(e).ok().map(|b| (e, b))) {
                         validate(&bytes)?;
@@ -195,7 +206,18 @@ impl Cache {
                     return Err(error);
                 }
             }
-        } else { (url.to_owned(), url.split("/download/").nth(1).and_then(|s| s.split_once('/')).map(|(tag, _)| tag).unwrap_or("distribution").to_owned()) };
+        } else if url.starts_with("https://github.com/") {
+            match resolve_release(client, url) {
+                Ok(release) => release,
+                Err(error) => {
+                    if let Some((entry, bytes)) = current.and_then(|e| self.verify(e).ok().map(|b| (e, b))) {
+                        validate(&bytes)?;
+                        return Ok((entry.clone(), bytes));
+                    }
+                    return Err(error);
+                }
+            }
+        } else { (url.to_owned(), "distribution".to_owned(), None) };
         if let Some((entry, bytes)) = current.filter(|e| e.url == resolved && (shader || !update))
             .and_then(|e| self.verify(e).ok().map(|b| (e, b))) {
             validate(&bytes)?;
@@ -204,6 +226,9 @@ impl Cache {
         let bytes = download(client, &resolved, MAX_ARCHIVE)?;
         validate(&bytes)?;
         let digest = sha256(&bytes);
+        if expected_digest.as_ref().is_some_and(|expected| !expected.eq_ignore_ascii_case(&digest)) {
+            bail!("Download failed the publisher's SHA-256 digest check.");
+        }
         let entry = Cached { digest, version, url: resolved, size: bytes.len() as u64 };
         atomic_write(&self.file(&entry.digest)?, &bytes)?;
         entries.0.insert(url.to_owned(), entry.clone());
@@ -239,6 +264,29 @@ impl Cache {
                 .then(|| (meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), meta.len(), path))
         }).collect()
     }
+}
+
+fn resolve_release(client: &Client, url: &str) -> Result<(String, String, Option<String>)> {
+    let url = Url::parse(url)?;
+    if url.host_str() != Some("github.com") { bail!("Unsupported add-on source"); }
+    let parts: Vec<_> = url.path_segments().context("Invalid release URL")?.collect();
+    let (owner, repo, ref_path, asset) = match parts.as_slice() {
+        [owner, repo, "releases", "latest", "download", asset] => (*owner, *repo, "latest".to_owned(), *asset),
+        [owner, repo, "releases", "download", tag, asset] => (*owner, *repo, format!("tags/{tag}"), *asset),
+        _ => bail!("Unsupported add-on release path"),
+    };
+    let api = format!("https://api.github.com/repos/{owner}/{repo}/releases/{ref_path}");
+    let response: serde_json::Value = serde_json::from_slice(&download(client, &api, 2 * 1024 * 1024)?)?;
+    let tag = response["tag_name"].as_str().context("The add-on release has no version")?;
+    let assets = response["assets"].as_array().context("The add-on release has no assets")?;
+    let resolved = assets.iter().find(|entry| entry["browser_download_url"].as_str().is_some_and(|url| url.ends_with(&format!("/{asset}"))))
+        .context("The configured add-on asset was not in the release")?;
+    let download_url = resolved["browser_download_url"].as_str().context("The add-on asset has no download URL")?;
+    if !download_url.starts_with(&format!("https://github.com/{owner}/{repo}/releases/download/")) {
+        bail!("The add-on asset points outside the configured repository.");
+    }
+    let digest = resolved["digest"].as_str().and_then(|value| value.strip_prefix("sha256:")).map(str::to_owned);
+    Ok((download_url.into(), tag.into(), digest))
 }
 
 fn resolve_shader(client: &Client, url: &str) -> Result<(String, String)> {

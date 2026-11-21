@@ -9,7 +9,7 @@ use reshade_manager::{
     pe::{self, Api, Target},
     storage::{self, Settings},
 };
-use slint::{ComponentHandle, Image, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, Image, ModelRc, VecModel};
 use std::{
     cell::RefCell, collections::{BTreeMap, BTreeSet}, fs, path::{Path, PathBuf},
     rc::Rc, sync::mpsc, thread, time::Duration,
@@ -231,7 +231,7 @@ fn review(ui: &ManagerWindow, state: &State) {
     let display = |packages: &[Package], selected: &dyn Fn(&Package) -> bool| {
         let cache = cache(state);
         let rows: Vec<_> = packages.iter().filter(|p| selected(p)).map(|p| {
-            let source = cache.status(&p.url).map(|c| format!("cached · {}", &c.version[..c.version.len().min(12)]))
+            let source = cache.status(&p.url).map(|c| format!("cached · {}", c.version.chars().take(12).collect::<String>()))
                 .unwrap_or_else(|| "download required".into());
             format!("  {} · {source}", p.name)
         }).collect();
@@ -309,8 +309,8 @@ fn render_catalog(ui: &ManagerWindow, state: &State) {
 fn load_catalog(ui: &ManagerWindow, state: &State) {
     let Some(session) = &state.session else { return; };
     let Ok(target) = &session.target else { return; };
-    if session.api == Some(Api::Vulkan) || session.status.vulkan || target.base != target.executable.parent().unwrap_or(Path::new("")) {
-        ui.set_stage("Use legacy setup for shared layers or compatibility installation directories.".into());
+    if session.api == Some(Api::Vulkan) || session.status.vulkan {
+        ui.set_stage("Use legacy setup for the shared Vulkan layer.".into());
         return;
     }
     if matches!(session.operation, Operation::Update | Operation::Uninstall) {
@@ -646,7 +646,7 @@ fn open_path(path: &Path) -> Result<()> {
 fn open_path(_: &Path) -> Result<()> { bail!("This action is available on Windows.") }
 
 fn manage_preset(target: &Target) -> Result<()> {
-    let config = target.base.join("ReShade.ini");
+    let config = storage::safe_child(&target.base, Path::new("ReShade.ini"))?;
     let Some(source) = pick_file("ReShade preset", &["ini"]) else { return Ok(()); };
     let directory = storage::safe_child(&target.base, Path::new(".reshade-manager/presets"))?;
     let bytes = fs::read(&source)?;
@@ -673,6 +673,9 @@ fn legacy_setup(session: &Session) -> Result<()> {
 
 fn main() -> Result<()> {
     let start = std::time::Instant::now();
+    if std::env::args().any(|arg| arg == "--render-fixtures") {
+        return render_fixtures();
+    }
     let data = storage::data_directory()?;
     fs::create_dir_all(&data)?;
     let settings = storage::read_json::<Settings>(&data.join("settings.json")).unwrap_or_else(|error| {
@@ -680,8 +683,9 @@ fn main() -> Result<()> {
         Settings::default()
     });
     let (events, receiver) = mpsc::channel();
+    let metadata = compatibility(&data);
     let games = storage::read_json::<Vec<Game>>(&data.join("library.json")).unwrap_or_default().into_iter().map(|game| {
-        let summary = inspect(&game, &compatibility(&data));
+        let summary = inspect(&game, &metadata);
         ViewGame { game, summary, artwork: None }
     }).collect();
     let state = Rc::new(RefCell::new(State { data, settings, games, query: String::new(), filter: 0, session: None, events, artwork_generation: 0 }));
@@ -709,6 +713,54 @@ fn main() -> Result<()> {
     } else {
         artwork_jobs(&mut state.borrow_mut(), None);
     }
+    let automatic = slint::Timer::default();
+    let weak = ui.as_weak();
+    let monitor = state.clone();
+    automatic.start(slint::TimerMode::Repeated, Duration::from_secs(180), move || {
+        let model = monitor.borrow();
+        if let Some(ui) = weak.upgrade().filter(|ui| ui.get_page() == 0 && !ui.get_busy() && model.settings.scan_on_launch) {
+            scan(&ui, &model);
+        }
+    });
     ui.run()?;
+    Ok(())
+}
+
+
+fn render_fixtures() -> Result<()> {
+    use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
+    use slint::platform::{Platform, WindowAdapter};
+    struct ScreenshotPlatform(Rc<MinimalSoftwareWindow>);
+    impl Platform for ScreenshotPlatform {
+        fn create_window_adapter(&self) -> std::result::Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
+            Ok(self.0.clone())
+        }
+    }
+    let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+    slint::platform::set_platform(Box::new(ScreenshotPlatform(window.clone())))
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    let ui = ManagerWindow::new()?;
+    ui.window().set_size(slint::PhysicalSize::new(1136, 748));
+    ui.show()?;
+    let directory = storage::data_directory()?;
+    fs::create_dir_all(&directory)?;
+    let rows_for_demo = vec![
+        GameRow { key: "1".into(), title: "Direct3D 11 fixture".into(), source: "Steam".into(), status: "Installed · 6.8.0".into(), installed: true, art: Image::default() },
+        GameRow { key: "2".into(), title: "OpenGL fixture".into(), source: "Epic Games".into(), status: "Not installed".into(), installed: false, art: Image::default() },
+        GameRow { key: "3".into(), title: "Vulkan fixture".into(), source: "GOG Galaxy".into(), status: "Not installed".into(), installed: false, art: Image::default() },
+    ];
+    ui.set_game(rows_for_demo[1].clone());
+    ui.set_games(rows(rows_for_demo));
+    let capture = |name| -> Result<()> {
+        let pixels = ui.window().take_snapshot()?;
+        image::save_buffer(directory.join(name), pixels.as_bytes(), pixels.width(), pixels.height(), image::ColorType::Rgba8)?;
+        Ok(())
+    };
+    capture("game-library.png")?;
+    ui.set_details("Not installed\nArchitecture · x64\nGraphics API · OpenGL\n\nC:\\Games\\Fixture\\Fixture.exe".into());
+    ui.set_usable(true);
+    ui.set_page(2);
+    capture("game-details.png")?;
+    ui.hide()?;
     Ok(())
 }

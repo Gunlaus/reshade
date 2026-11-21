@@ -29,23 +29,89 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            manager/target
+          key: manager-windows-${{ hashFiles('manager/Cargo.toml', 'manager/Cargo.lock') }}
+      - name: Build x86 and x64 PE test fixtures
+        working-directory: manager
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'Visual Studio C++ tools unavailable' }
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build'
+          $fixtures = Join-Path $PWD 'target\fixtures'
+          New-Item -ItemType Directory -Force $fixtures | Out-Null
+          foreach ($item in @(@{ Arch='32'; Env='x86'; Mode='standard'; Define='' }, @{ Arch='64'; Env='x64'; Mode='standard'; Define='' }, @{ Arch='64'; Env='x64'; Mode='addon'; Define='/DFULL_ADDON' })) {
+            $prefix = $item.Mode + $item.Arch
+            $vc = Join-Path $vcvars ('vcvars' + $(if ($item.Arch -eq '32') { '32' } else { '64' }) + '.bat')
+            $commands = @(
+              '@echo off',
+              ('call "' + $vc + '" || exit /b 1'),
+              'rc /nologo /fo version.res runtime.rc || exit /b 1',
+              ('cl /nologo /LD /MT ' + $item.Define + ' runtime.c version.res /link /OUT:' + $prefix + '.dll || exit /b 1')
+            )
+            Copy-Item tests/fixtures/runtime.* $fixtures
+            Set-Content -Path (Join-Path $fixtures 'build.cmd') -Value $commands -Encoding ascii
+            Push-Location $fixtures
+            try {
+              cmd.exe /d /c build.cmd
+              if ($LASTEXITCODE) { throw "Failed to build fixture $prefix" }
+            } finally { Pop-Location }
+          }
+          "RESHADE_TEST_FIXTURES=$fixtures" >> $env:GITHUB_ENV
       - name: Build and test native manager
-        if: ${{ hashFiles('manager/Cargo.toml') != '' }}
         working-directory: manager
         run: |
           cargo test --all-targets
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo build --release
-      - name: Record portable executable size
-        if: ${{ hashFiles('manager/Cargo.toml') != '' }}
+      - name: Record executable size and capture native UI
         run: |
           $exe = Get-Item manager/target/release/reshade-manager.exe
           "Portable manager executable: $($exe.Length) bytes" >> $env:GITHUB_STEP_SUMMARY
+          $env:RESHADE_MANAGER_DATA = Join-Path $env:RUNNER_TEMP 'manager-screenshots'
+          $process = Start-Process $exe.FullName '--render-fixtures' -PassThru -Wait
+          if ($process.ExitCode) { throw 'Slint screenshot capture failed' }
+          if (!(Test-Path (Join-Path $env:RESHADE_MANAGER_DATA 'game-library.png'))) { throw 'Expected screenshot was not produced' }
+          "SCREENSHOT_DIR=$env:RESHADE_MANAGER_DATA" >> $env:GITHUB_ENV
+      - name: Sample native startup and idle memory
+        continue-on-error: true
+        run: |
+          $env:RESHADE_MANAGER_DATA = Join-Path $env:RUNNER_TEMP 'manager-startup'
+          New-Item -ItemType Directory -Force $env:RESHADE_MANAGER_DATA | Out-Null
+          $process = Start-Process (Resolve-Path manager/target/release/reshade-manager.exe) '--measure-startup' -PassThru
+          try {
+            $sample = Join-Path $env:RESHADE_MANAGER_DATA 'startup-ms.txt'
+            for ($i=0; $i -lt 40 -and !(Test-Path $sample) -and !$process.HasExited; $i++) { Start-Sleep -Milliseconds 250 }
+            if (!(Test-Path $sample)) { throw 'The hosted runner desktop did not yield an interactive startup sample.' }
+            $startup = Get-Content $sample
+            Start-Sleep -Seconds 2
+            $metrics = Get-Process -Id $process.Id
+            "Windows runner sample: ${startup} ms to event loop, $($metrics.WorkingSet64) bytes working set and $($metrics.PrivateMemorySize64) bytes private memory." >> $env:GITHUB_STEP_SUMMARY
+          } finally {
+            if (!$process.HasExited) { Stop-Process -Id $process.Id }
+          }
       - uses: actions/upload-artifact@v7
-        if: ${{ hashFiles('manager/Cargo.toml') != '' }}
         with:
           name: ReShade Manager Windows
-          path: manager/target/release/reshade-manager.exe
+          path: |
+            manager/target/release/reshade-manager.exe
+            LICENSE.md
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ReShade Manager screenshots
+          path: ${{ env.SCREENSHOT_DIR }}/*.png
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Cargo lockfile
+          path: manager/Cargo.lock
           if-no-files-found: error
 
   legacy-compatibility:
@@ -71,3 +137,21 @@ jobs:
           name: ReShade legacy setup
           path: bin/AnyCPU/Release/ReShade Setup.exe
           if-no-files-found: error
+
+  official-distribution:
+    runs-on: windows-latest
+    steps:
+      - name: Check availability and SHA-256 of upstream distributions
+        continue-on-error: true
+        run: |
+          foreach ($name in @('ReShade_Setup_6.8.0.exe', 'ReShade_Setup_6.8.0_Addon.exe')) {
+            $path = Join-Path $env:RUNNER_TEMP $name
+            try {
+              Invoke-WebRequest "https://reshade.me/downloads/$name" -OutFile $path -TimeoutSec 25
+              $hash = (Get-FileHash -Algorithm SHA256 $path).Hash
+              $signer = (Get-AuthenticodeSignature $path)
+              "$name SHA-256 $hash signature $($signer.Status) signer $($signer.SignerCertificate.Thumbprint)"
+            } catch {
+              "Could not obtain $name from the hosted runner. $_"
+            }
+          }

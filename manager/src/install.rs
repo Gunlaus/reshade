@@ -91,14 +91,19 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
     let target = plan.target;
     let base = &target.base;
     if target.banned && plan.operation != Operation::Uninstall { bail!("Upstream compatibility metadata marks this executable as blocked."); }
+    if plan.operation == Operation::Modify && target.base != target.executable.parent().context("Executable folder unavailable")? && !plan.selection.addons.is_empty() {
+        bail!("Use legacy setup to modify add-ons for a redirected install directory.");
+    }
     if plan.addon && !plan.acknowledged && plan.operation != Operation::Uninstall {
         bail!("Acknowledge the add-on support warning before continuing.");
     }
     if target.forced && target.api != Some(plan.api) { bail!("This executable requires its upstream compatibility API."); }
     let module = PathBuf::from(wrapper_name(plan.api)?);
     if !base.is_dir() { bail!("The destination directory does not exist."); }
-    let _lock = lock(base)?;
-    recover(base)?;
+    let root = target.executable.parent().context("The executable has no parent directory")?;
+    let prefix = base.strip_prefix(root).context("The install destination is outside the executable directory")?;
+    let _lock = lock(root)?;
+    recover(root)?;
     let mut previous = receipt(base)?;
     if previous.game.as_ref().is_some_and(|exe| !same_path(exe, &target.executable)) {
         bail!("This directory already contains settings managed for another executable. Select that game to manage its installation.");
@@ -130,7 +135,7 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
         }
         changes.insert(RECEIPT.into(), None);
         progress("Removing ReShade runtime and verified managed files");
-        return apply(base, changes, plan.backups);
+        return apply(root, relocate(changes, prefix), plan.backups);
     }
 
     let client = catalog::client()?;
@@ -180,11 +185,17 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
             }
         }
         if plan.addon {
+            if base != root && !plan.selection.addons.is_empty() { bail!("Use legacy setup for add-ons in redirected installation directories."); }
+            let config = optional_config(&safe_child(root, Path::new("ReShade.ini"))?)?;
+            let ini = parse_ini(&config);
+            let addon_dir = ini.get("addon").and_then(|v| v.get("addonpath")).filter(|p| !p.trim().is_empty()).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+            if !plan.selection.addons.is_empty() { safe_child(base, &addon_dir)?; }
             for package in plan.addons.iter().filter(|p| plan.selection.addons.contains(&p.id)) {
                 progress(&format!("Downloading or validating {}", package.name));
                 let (_, bytes) = cache.obtain(&client, &package.url, false, false, |data| addon_entries(package, data, target.arch).map(|_| ()))?;
                 for item in addon_entries(package, &bytes, target.arch)? {
-                    stage_owned(base, &previous, &mut owned, &mut changes, item.path, item.bytes)?;
+                    let destination = if item.path.starts_with(".reshade-manager") { item.path } else { addon_dir.join(item.path) };
+                    stage_owned(base, &previous, &mut owned, &mut changes, destination, item.bytes)?;
                 }
             }
         }
@@ -205,26 +216,36 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
 
     progress("Configuring effect and texture search paths");
     let config_path = safe_child(base, Path::new("ReShade.ini"))?;
-    let original = match fs::read_to_string(config_path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error).context("Read existing ReShade.ini"),
-    };
+    let original = optional_config(&config_path)?;
     let config = configure(&original, target, &previous, &effects, &textures)?;
     changes.insert("ReShade.ini".into(), Some(config.into_bytes()));
-    if let Some(root) = target.executable.parent().filter(|root| *root != base.as_path()) {
-        if base.parent() != Some(root) { bail!("This compatibility installation target needs legacy setup."); }
-        // The game-level INI is a separate destination. Legacy setup is required to update it atomically.
-        bail!("This game requires ReShade's redirected install directory. Use the legacy installer.");
+    let mut changes = relocate(changes, prefix);
+    if !prefix.as_os_str().is_empty() {
+        let global = optional_config(&safe_child(root, Path::new("ReShade.ini"))?)?;
+        let base_path = path_setting(base, false)?;
+        let global = set_ini(&global, "INSTALL", "BasePath", &base_path);
+        changes.insert("ReShade.ini".into(), Some(global.into_bytes()));
     }
     previous.game = Some(target.executable.clone());
     previous.live_effects = effects;
     previous.live_textures = textures;
-    changes.insert(RECEIPT.into(), Some(serde_json::to_vec_pretty(&previous)?));
+    changes.insert(prefix.join(RECEIPT), Some(serde_json::to_vec_pretty(&previous)?));
     progress("Installing and verifying files");
-    apply(base, changes, plan.backups)?;
+    apply(root, changes, plan.backups)?;
     progress("Final verification complete");
     Ok(())
+}
+
+fn relocate(changes: BTreeMap<PathBuf, Option<Vec<u8>>>, prefix: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    changes.into_iter().map(|(path, change)| (prefix.join(path), change)).collect()
+}
+
+fn optional_config(config: &Path) -> Result<String> {
+    match fs::read_to_string(config) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error).with_context(|| format!("Read {}", config.display())),
+    }
 }
 
 fn path_setting(path: &Path, recursive: bool) -> Result<String> {
@@ -384,7 +405,7 @@ fn addon_entries(package: &Package, bytes: &[u8], arch: Arch) -> Result<Vec<Arch
 fn stage_owned(base: &Path, previous: &Receipt, owned: &mut BTreeMap<PathBuf, String>, changes: &mut BTreeMap<PathBuf, Option<Vec<u8>>>, relative: PathBuf, bytes: Vec<u8>) -> Result<()> {
     let file = safe_child(base, &relative)?;
     let checksum = sha256(&bytes);
-    if owned.contains_key(&relative) { bail!("Two packages claim {}", file.display()); }
+    if owned.keys().any(|path| same_path(path, &relative)) { bail!("Two packages claim {}", file.display()); }
     if file.exists() {
         let current = sha256(&fs::read(&file)?);
         if previous.owned.get(&relative) != Some(&current) {
@@ -534,4 +555,77 @@ mod tests {
         assert_eq!(ini["general"]["presetpath"], "MyPreset.ini");
         assert_eq!(ini["general"]["effectsearchpaths"], "Custom,NewShared");
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn installation_lifecycle_uses_cached_packages_and_preserves_two_game_presets() {
+        use std::io::{Cursor, Write};
+        let Some(fixtures) = std::env::var_os("RESHADE_TEST_FIXTURES").map(PathBuf::from) else { return; };
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let cache = Cache { root: root.join("cache") };
+        let package = |id: &str, addon: bool, url: &str| Package { id: id.into(), name: id.into(), description: String::new(),
+            repository: String::new(), url: url.into(), effects: vec!["A.fx".into()], denied: vec![], required: !addon, enabled: !addon, addon };
+        let shader = package("shader", false, "https://github.com/test/example/archive/main.zip");
+        let addon = package("addon", true, "https://github.com/test/example/releases/download/v1/sample.addon64");
+        let make_zip = |prefix: &'static [u8], entries: &[(&str, &[u8])]| {
+            let mut data = Cursor::new(prefix.to_vec());
+            data.set_position(prefix.len() as u64);
+            let mut zip = zip::ZipWriter::new(data);
+            for (entry, bytes) in entries {
+                zip.start_file(*entry, zip::write::SimpleFileOptions::default()).unwrap();
+                zip.write_all(bytes).unwrap();
+            }
+            zip.finish().unwrap().into_inner()
+        };
+        let normal32 = fs::read(fixtures.join("standard32.dll")).unwrap();
+        let normal64 = fs::read(fixtures.join("standard64.dll")).unwrap();
+        let addon64 = fs::read(fixtures.join("addon64.dll")).unwrap();
+        let standard_archive = make_zip(b"MZ", &[("ReShade32.dll", &normal32), ("ReShade64.dll", &normal64)]);
+        let addon_archive = make_zip(b"MZ", &[("ReShade32.dll", &normal32), ("ReShade64.dll", &addon64)]);
+        cache.fixture(&runtime_url(false), &standard_archive).unwrap();
+        cache.fixture(&runtime_url(true), &addon_archive).unwrap();
+        cache.fixture(&shader.url, &make_zip(b"", &[("repo/Shaders/A.fx", b"#include \"Common.fxh\""), ("repo/Shaders/Common.fxh", b"// fixture")])).unwrap();
+        cache.fixture(&addon.url, &addon64).unwrap();
+        let shaders = [shader];
+        let addons = [addon];
+        for (name, full, expected) in [("First", false, &normal64), ("Second", true, &addon64)] {
+            let base = root.join(name);
+            fs::create_dir(&base).unwrap();
+            let executable = base.join("Fixture.exe");
+            fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+            fs::write(base.join("ReShade.ini"), format!("[GENERAL]\nPresetPath={name}.ini\n")).unwrap();
+            fs::write(base.join(format!("{name}.ini")), format!("[custom]\nName={name}\n")).unwrap();
+            let target = Target { executable, base: base.clone(), arch: Arch::X64, api: Some(Api::Dxgi),
+                forced: false, banned: false, notes: vec![], compatibility: BTreeMap::new() };
+            let mut selection = Selection::defaults(&shaders);
+            if full { selection.addons.insert("addon".into()); }
+            let run = |op, acknowledged| execute(&cache, Plan { target: &target, api: Api::Dxgi, addon: full,
+                acknowledged, operation: op, selection: &selection, shaders: &shaders, addons: &addons,
+                shared: Some(&root.join("shared")), backups: None }, |_| {});
+            if full { assert!(run(Operation::Install, false).is_err()); }
+            fs::copy(&target.executable, base.join("dxgi.dll")).unwrap();
+            assert!(run(Operation::Install, true).is_err());
+            assert!(base.join("dxgi.dll").is_file());
+            fs::remove_file(base.join("dxgi.dll")).unwrap();
+            run(Operation::Install, true).unwrap();
+            assert_eq!(&fs::read(base.join("dxgi.dll")).unwrap(), expected);
+            assert_eq!(base.join("sample.addon64").exists(), full);
+            assert_eq!(status(&target.executable, &base).version.as_deref(), Some("6.8.0.0"));
+            assert_eq!(receipt(&base).unwrap().addon, full);
+            if !full {
+                fs::remove_file(base.join("dxgi.dll")).unwrap();
+                run(Operation::Repair, true).unwrap();
+                run(Operation::Update, true).unwrap();
+            }
+            run(Operation::Uninstall, true).unwrap();
+            assert!(!base.join("dxgi.dll").exists());
+            assert!(!base.join("sample.addon64").exists());
+            assert!(fs::read_to_string(base.join("ReShade.ini")).unwrap().contains(&format!("PresetPath={name}.ini")));
+            assert_eq!(fs::read_to_string(base.join(format!("{name}.ini"))).unwrap(), format!("[custom]\nName={name}\n"));
+        }
+        assert_eq!(fs::read_dir(root.join("shared")).unwrap().count(), 1);
+        assert_eq!(cache.stats().0, 4);
+    }
+
 }

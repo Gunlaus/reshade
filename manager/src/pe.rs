@@ -75,6 +75,7 @@ pub struct Target {
 
 pub fn analyze(executable: &Path, ini: &Ini) -> Result<Target> {
     let mut executable = executable.canonicalize()?;
+    let original_key = executable.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
     let root = executable.parent().context("Invalid executable directory")?;
     if let Some(relative) = resource_string(&executable) {
         if let Ok(path) = safe_child(root, Path::new(&relative)) {
@@ -83,7 +84,9 @@ pub fn analyze(executable: &Path, ini: &Ini) -> Result<Target> {
     }
     let root = executable.parent().context("Invalid executable directory")?;
     if let Some(windows) = std::env::var_os("WINDIR").and_then(|path| PathBuf::from(path).canonicalize().ok()) {
-        if root.to_string_lossy().to_lowercase().starts_with(&windows.to_string_lossy().to_lowercase()) {
+        let root_lower = root.to_string_lossy().to_lowercase();
+        let windows_lower = windows.to_string_lossy().to_lowercase();
+        if root_lower == windows_lower || root_lower.strip_prefix(windows_lower.as_str()).is_some_and(|rest| rest.starts_with(['\\', '/'])) {
             bail!("Installation inside the Windows directory is prohibited");
         }
     }
@@ -125,7 +128,7 @@ pub fn analyze(executable: &Path, ini: &Ini) -> Result<Target> {
         api = Some(Api::Vulkan);
     }
     if api.is_none() { notes.push("No graphics API could be inferred from the executable. Choose the renderer used to launch the game."); }
-    let banned = enabled("banned");
+    let banned = enabled("banned") || ini.get(&original_key).and_then(|entry| entry.get("banned")).is_some_and(|value| value == "1");
     Ok(Target { executable, base, arch, api, forced, banned, notes, compatibility })
 }
 
@@ -140,7 +143,8 @@ pub fn version_string(path: &Path, name: &str) -> Option<String> {
     }
     let path: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
     unsafe {
-        let size = GetFileVersionInfoSizeW(path.as_ptr(), ptr::null_mut());
+        let mut legacy_handle = 0;
+        let size = GetFileVersionInfoSizeW(path.as_ptr(), &mut legacy_handle);
         if size == 0 || size > 1_000_000 { return None; }
         let mut buffer = vec![0u32; (size as usize + 3) / 4];
         let data = buffer.as_mut_ptr().cast::<c_void>();

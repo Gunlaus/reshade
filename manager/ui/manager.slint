@@ -215,8 +215,8 @@ export component ManagerWindow inherits Window {
                         }
                         HorizontalLayout {
                             spacing: 7px;
-                            package: LineEdit { text: root.package-limit; placeholder-text: "Package limit MB"; }
-                            artwork: LineEdit { text: root.artwork-limit; placeholder-text: "Artwork limit MB"; }
+                            package := LineEdit { text: root.package-limit; placeholder-text: "Package limit MB"; }
+                            artwork := LineEdit { text: root.artwork-limit; placeholder-text: "Artwork limit MB"; }
                             Button { text: "Save limits (MB)"; enabled: !root.busy; clicked => { root.set-limits(package.text, artwork.text); } }
                         }
                         Button { text: "Open diagnostics"; clicked => { root.diagnostics(); } }
