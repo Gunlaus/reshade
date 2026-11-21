@@ -107,13 +107,17 @@ jobs:
         run: |
           $exe = Get-Item manager/target/release/reshade-manager.exe
           $env:RESHADE_MANAGER_DATA = Join-Path $env:RUNNER_TEMP 'manager-screenshots'
-          $process = Start-Process $exe.FullName '--render-fixtures' -PassThru -Wait
-          if ($process.ExitCode) {
-            $log = Join-Path $env:RESHADE_MANAGER_DATA 'manager.log'
-            if (Test-Path $log) { Get-Content $log }
-            throw "Slint screenshot command exited with code $($process.ExitCode)"
+          foreach ($fixture in @('--render-fixtures', '--render-fixtures --details')) {
+            $process = Start-Process $exe.FullName $fixture -PassThru -Wait
+            if ($process.ExitCode) {
+              $log = Join-Path $env:RESHADE_MANAGER_DATA 'manager.log'
+              if (Test-Path $log) { Get-Content $log }
+              throw "Slint screenshot command exited with code $($process.ExitCode)"
+            }
           }
-          if (!(Test-Path (Join-Path $env:RESHADE_MANAGER_DATA 'game-library.png'))) { throw 'Expected screenshot was not produced' }
+          foreach ($name in @('game-library.png', 'game-details.png')) {
+            if (!(Test-Path (Join-Path $env:RESHADE_MANAGER_DATA $name))) { throw "Screenshot was not produced: $name" }
+          }
           "SCREENSHOT_DIR=$env:RESHADE_MANAGER_DATA" >> $env:GITHUB_ENV
       - name: Sample native startup and idle memory
         continue-on-error: true

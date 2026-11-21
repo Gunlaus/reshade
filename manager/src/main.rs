@@ -849,45 +849,40 @@ fn run() -> Result<()> {
 
 
 fn render_fixtures() -> Result<()> {
-    use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
-    use slint::platform::{Platform, WindowAdapter};
-    struct ScreenshotPlatform(Rc<MinimalSoftwareWindow>);
-    impl Platform for ScreenshotPlatform {
-        fn create_window_adapter(&self) -> std::result::Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
-            Ok(self.0.clone())
-        }
-    }
-    let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
-    slint::platform::set_platform(Box::new(ScreenshotPlatform(window.clone())))
-        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    let details = std::env::args().any(|arg| arg == "--details");
     let ui = ManagerWindow::new()?;
-    const WIDTH: u32 = 1136;
-    const HEIGHT: u32 = 748;
-    ui.window().set_size(slint::PhysicalSize::new(WIDTH, HEIGHT));
-    ui.show()?;
     let directory = storage::data_directory()?;
     fs::create_dir_all(&directory)?;
-    let rows_for_demo = vec![
+    let fixture_games = vec![
         GameRow { key: "1".into(), title: "Direct3D 11 fixture".into(), source: "Steam".into(), status: "Installed · 6.8.0".into(), installed: true, art: Image::default() },
         GameRow { key: "2".into(), title: "OpenGL fixture".into(), source: "Epic Games".into(), status: "Not installed".into(), installed: false, art: Image::default() },
         GameRow { key: "3".into(), title: "Vulkan fixture".into(), source: "GOG Galaxy".into(), status: "Not installed".into(), installed: false, art: Image::default() },
     ];
-    ui.set_game(rows_for_demo[1].clone());
-    ui.set_games(rows(rows_for_demo));
-    let capture = |name| -> Result<()> {
-        let mut pixels = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(WIDTH, HEIGHT);
-        window.request_redraw();
-        if !window.draw_if_needed(|renderer| { renderer.render(pixels.make_mut_slice(), WIDTH as usize); }) {
-            bail!("The software window did not request a frame.");
-        }
-        image::save_buffer(directory.join(name), pixels.as_bytes(), WIDTH, HEIGHT, image::ColorType::Rgb8)?;
-        Ok(())
-    };
-    capture("game-library.png")?;
-    ui.set_details("Not installed\nArchitecture · x64\nGraphics API · OpenGL\n\nC:\\Games\\Fixture\\Fixture.exe".into());
-    ui.set_usable(true);
-    ui.set_page(2);
-    capture("game-details.png")?;
-    ui.hide()?;
-    Ok(())
+    if details {
+        ui.set_game(fixture_games[1].clone());
+        ui.set_details("Not installed\nArchitecture · x64\nGraphics API · OpenGL\n\nC:\\Games\\Fixture\\Fixture.exe".into());
+        ui.set_usable(true);
+        ui.set_page(2);
+    } else {
+        ui.set_games(rows(fixture_games));
+    }
+    let name = if details { "game-details.png" } else { "game-library.png" };
+    let path = directory.join(name);
+    let weak = ui.as_weak();
+    let capture_result = Rc::new(RefCell::new(None));
+    let callback_result = capture_result.clone();
+    slint::Timer::single_shot(Duration::from_millis(750), move || {
+        let result = (|| -> Result<()> {
+            let window = weak.upgrade().context("Fixture window was closed")?;
+            let pixels = window.window().take_snapshot().context("Capture native Slint window")?;
+            let rgb: Vec<u8> = pixels.as_slice().iter().flat_map(|p| [p.r, p.g, p.b]).collect();
+            image::save_buffer(path, &rgb, pixels.width(), pixels.height(), image::ColorType::Rgb8)?;
+            Ok(())
+        })();
+        *callback_result.borrow_mut() = Some(result);
+        let _ = slint::quit_event_loop();
+    });
+    ui.run()?;
+    let result = capture_result.borrow_mut().take();
+    result.context("The window closed before the fixture was captured")?
 }
