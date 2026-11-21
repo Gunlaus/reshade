@@ -1,0 +1,73 @@
+name: ReShade Manager Windows
+
+on:
+  push:
+    branches: [feature/reshade-2-manager]
+    paths:
+      - 'manager/**'
+      - 'setup/**'
+      - '.github/workflows/manager.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'manager/**'
+      - 'setup/**'
+      - '.github/workflows/manager.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manager-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  manager:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Build and test native manager
+        if: ${{ hashFiles('manager/Cargo.toml') != '' }}
+        working-directory: manager
+        run: |
+          cargo test --all-targets
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo build --release
+      - name: Record portable executable size
+        if: ${{ hashFiles('manager/Cargo.toml') != '' }}
+        run: |
+          $exe = Get-Item manager/target/release/reshade-manager.exe
+          "Portable manager executable: $($exe.Length) bytes" >> $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v7
+        if: ${{ hashFiles('manager/Cargo.toml') != '' }}
+        with:
+          name: ReShade Manager Windows
+          path: manager/target/release/reshade-manager.exe
+          if-no-files-found: error
+
+  legacy-compatibility:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: true
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - uses: microsoft/setup-msbuild@v3
+      - name: Build unchanged x86 runtime
+        run: msbuild ReShade.sln /p:Configuration=Release /p:Platform=32-bit
+      - name: Build unchanged x64 runtime
+        run: msbuild ReShade.sln /p:Configuration=Release /p:Platform=64-bit
+      - name: Build legacy setup fallback
+        run: msbuild ReShade.sln '/p:Configuration=Release Setup' /p:Platform=64-bit
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ReShade legacy setup
+          path: bin/AnyCPU/Release/ReShade Setup.exe
+          if-no-files-found: error
