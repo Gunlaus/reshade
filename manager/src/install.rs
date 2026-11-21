@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::{collections::{BTreeMap, BTreeSet}, fs, path::{Path, PathBuf}};
 
 pub const RUNTIME_VERSION: &str = "6.8.0";
+const STANDARD_SETUP_SHA256: &str = "207aea16205fbf952bc8fe1879966672454cf04002e7ad34237c7990a5b3c0b4";
+const ADDON_SETUP_SHA256: &str = "afe4c8f13048306307983b8b3d41d5bf00a86820440b0e57dea10950e1176445";
+
 const RECEIPT: &str = ".reshade-manager/installation.json";
 const JOURNAL: &str = ".reshade-manager/transaction.json";
 const WRAPPERS: [&str; 7] = ["d3d9.dll", "dxgi.dll", "d3d10.dll", "d3d11.dll", "d3d12.dll", "opengl32.dll", "ddraw.dll"];
@@ -12,9 +15,11 @@ const WRAPPERS: [&str; 7] = ["d3d9.dll", "dxgi.dll", "d3d10.dll", "d3d11.dll", "
 pub enum Operation { Install, Update, Repair, Modify, Uninstall }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct Receipt {
     pub game: Option<PathBuf>,
     pub runtime: Option<String>,
+    pub api: Option<Api>,
     pub addon: bool,
     pub selection: Selection,
     owned: BTreeMap<PathBuf, String>,
@@ -69,6 +74,22 @@ pub fn runtime_url(addon: bool) -> String {
     format!("https://reshade.me/downloads/ReShade_Setup_{RUNTIME_VERSION}{mode}.exe")
 }
 
+pub fn verify_distribution(bytes: &[u8], addon: bool) -> Result<()> {
+    let expected = if addon { ADDON_SETUP_SHA256 } else { STANDARD_SETUP_SHA256 };
+    if sha256(bytes) != expected {
+        bail!("This file does not match the pinned official ReShade {RUNTIME_VERSION} distribution.");
+    }
+    Ok(())
+}
+
+fn distribution_dll(bytes: &[u8], arch: Arch, addon: bool) -> Result<Vec<u8>> {
+    #[cfg(not(test))]
+    verify_distribution(bytes, addon)?;
+    #[cfg(test)]
+    let _ = addon;
+    extract_runtime(bytes, arch)
+}
+
 pub fn wrapper_name(api: Api) -> Result<String> {
     if api == Api::Vulkan { bail!("Vulkan uses the legacy setup to manage the shared Windows layer."); }
     Ok(format!("{}.dll", api.name()))
@@ -109,6 +130,9 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
         bail!("This directory already contains settings managed for another executable. Select that game to manage its installation.");
     }
     let existing = status(&target.executable, base);
+    if plan.operation == Operation::Update && existing.version.as_deref().is_some_and(is_newer_than_distribution) {
+        bail!("The installed runtime is newer than the manager’s pinned distribution.");
+    }
     if existing.conflict || existing.vulkan { bail!("Multiple runtime wrappers or a shared Vulkan layer are present. Resolve the existing installation in legacy setup."); }
     let destination = safe_child(base, &module)?;
     if destination.exists() && pe::version_string(&destination, "ProductName").as_deref() != Some("ReShade") {
@@ -121,7 +145,7 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
             changes.insert(PathBuf::from(wrapper.file_name().context("Missing wrapper filename")?), None);
         }
         for (file, checksum) in &previous.owned {
-            if file.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll")) { continue; }
+            if !is_managed_resource(file) { continue; }
             let path = safe_child(base, file)?;
             if fs::read(path).is_ok_and(|bytes| sha256(&bytes) == *checksum) {
                 changes.insert(file.clone(), None);
@@ -143,7 +167,7 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
     if plan.operation != Operation::Modify {
         progress("Downloading or reusing the ReShade distribution");
         let url = runtime_url(plan.addon);
-        let runtime = |data: &[u8]| extract_runtime(data, target.arch);
+        let runtime = |data: &[u8]| distribution_dll(data, target.arch, plan.addon);
         let (_, data) = cache.obtain(&client, &url, false, false, |d| runtime(d).map(|_| ()))?;
         progress("Validating the runtime and executable architecture");
         let dll = runtime(&data)?;
@@ -156,6 +180,7 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
             }
         }
         previous.runtime = Some(RUNTIME_VERSION.into());
+        previous.api = Some(plan.api);
         previous.addon = plan.addon;
     }
     let mut effects = BTreeSet::new();
@@ -200,7 +225,7 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
             }
         }
         for (file, checksum) in &previous.owned {
-            if owned.contains_key(file) || file.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll")) { continue; }
+            if owned.contains_key(file) || !is_managed_resource(file) { continue; }
             let path = safe_child(base, file)?;
             if fs::read(path).is_ok_and(|data| sha256(&data) == *checksum) {
                 changes.insert(file.clone(), None);
@@ -217,7 +242,11 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
     progress("Configuring effect and texture search paths");
     let config_path = safe_child(base, Path::new("ReShade.ini"))?;
     let original = optional_config(&config_path)?;
-    let config = configure(&original, target, &previous, &effects, &textures)?;
+    let config = if plan.operation == Operation::Update && !original.is_empty() {
+        original
+    } else {
+        configure(&original, target, &previous, &effects, &textures)?
+    };
     changes.insert("ReShade.ini".into(), Some(config.into_bytes()));
     let mut changes = relocate(changes, prefix);
     if !prefix.as_os_str().is_empty() {
@@ -234,6 +263,16 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
     apply(root, changes, plan.backups)?;
     progress("Final verification complete");
     Ok(())
+}
+
+fn is_newer_than_distribution(installed: &str) -> bool {
+    fn version(input: &str) -> Vec<u32> {
+        let mut parts: Vec<_> = input.trim_start_matches('v').split('.').take(3)
+            .map(|part| part.parse::<u32>().unwrap_or(0)).collect();
+        parts.resize(3, 0);
+        parts
+    }
+    version(installed) > version(RUNTIME_VERSION)
 }
 
 fn relocate(changes: BTreeMap<PathBuf, Option<Vec<u8>>>, prefix: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
@@ -402,7 +441,13 @@ fn addon_entries(package: &Package, bytes: &[u8], arch: Arch) -> Result<Vec<Arch
     Ok(result)
 }
 
+fn is_managed_resource(path: &Path) -> bool {
+    path.starts_with(".reshade-manager/library") || path.starts_with(".reshade-manager/licenses")
+        || path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("addon32") || ext.eq_ignore_ascii_case("addon64"))
+}
+
 fn stage_owned(base: &Path, previous: &Receipt, owned: &mut BTreeMap<PathBuf, String>, changes: &mut BTreeMap<PathBuf, Option<Vec<u8>>>, relative: PathBuf, bytes: Vec<u8>) -> Result<()> {
+    if !is_managed_resource(&relative) { bail!("Invalid managed resource path."); }
     let file = safe_child(base, &relative)?;
     let checksum = sha256(&bytes);
     if owned.keys().any(|path| same_path(path, &relative)) { bail!("Two packages claim {}", file.display()); }
@@ -459,7 +504,12 @@ fn recover(base: &Path) -> Result<()> {
     for item in journal.entries.into_iter().rev() {
         let target = safe_child(base, &item.relative)?;
         match item.previous {
-            Some(backup) => atomic_write(&target, &fs::read(safe_child(base, &backup)?)?)?,
+            Some(backup) => {
+                let bytes = fs::read(safe_child(base, &backup)?)?;
+                if !fs::read(&target).is_ok_and(|current| current == bytes) {
+                    atomic_write(&target, &bytes)?;
+                }
+            }
             None if target.is_file() => fs::remove_file(target)?,
             None => {}
         }
@@ -626,6 +676,20 @@ mod tests {
         }
         assert_eq!(fs::read_dir(root.join("shared")).unwrap().count(), 1);
         assert_eq!(cache.stats().0, 4);
+    }
+
+
+    #[cfg(windows)]
+    #[test]
+    fn verifies_official_distribution_layout_when_provided_by_ci() {
+        let Some(directory) = std::env::var_os("RESHADE_UPSTREAM_TEST_ASSETS").map(PathBuf::from) else { return; };
+        for (filename, full) in [("ReShade_Setup_6.8.0.exe", false), ("ReShade_Setup_6.8.0_Addon.exe", true)] {
+            let bytes = fs::read(directory.join(filename)).unwrap();
+            verify_distribution(&bytes, full).unwrap();
+            for arch in [Arch::X86, Arch::X64] {
+                assert!(!extract_runtime(&bytes, arch).unwrap().is_empty());
+            }
+        }
     }
 
 }

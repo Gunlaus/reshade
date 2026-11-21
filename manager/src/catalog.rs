@@ -96,9 +96,11 @@ impl Selection {
     }
 }
 
-pub fn client() -> Result<Client> {
+pub fn client() -> Result<Client> { client_with_timeout(Duration::from_secs(45)) }
+
+pub fn client_with_timeout(timeout: Duration) -> Result<Client> {
     Ok(Client::builder().user_agent("ReShade-Manager")
-        .connect_timeout(Duration::from_secs(5)).timeout(Duration::from_secs(45))
+        .connect_timeout(Duration::from_secs(5)).timeout(timeout)
         .https_only(true).redirect(reqwest::redirect::Policy::custom(|attempt| {
             let trusted = attempt.url().host_str().is_some_and(|host| matches!(host, "reshade.me" | "www.reshade.me" | "github.com" | "api.github.com" | "raw.githubusercontent.com" | "codeload.github.com" | "release-assets.githubusercontent.com" | "objects.githubusercontent.com" | "cdn.akamai.steamstatic.com"));
             if trusted && attempt.previous().len() < 8 { attempt.follow() } else { attempt.error("Untrusted redirect destination") }
@@ -287,6 +289,24 @@ fn resolve_release(client: &Client, url: &str) -> Result<(String, String, Option
     }
     let digest = resolved["digest"].as_str().and_then(|value| value.strip_prefix("sha256:")).map(str::to_owned);
     Ok((download_url.into(), tag.into(), digest))
+}
+
+pub fn available_updates(client: &Client, cache: &Cache, packages: &[Package]) -> Result<(Vec<String>, usize)> {
+    let mut updates = Vec::new();
+    let mut checked = 0;
+    let mut errors = 0;
+    for package in packages {
+        let Some(cached) = cache.status(&package.url) else { continue; };
+        match resolve_shader(client, &package.url) {
+            Ok((_, latest)) => {
+                checked += 1;
+                if latest != cached.version { updates.push(package.name.clone()); }
+            }
+            Err(_) => errors += 1,
+        }
+    }
+    if checked == 0 && errors != 0 { bail!("GitHub did not return shader repository revisions."); }
+    Ok((updates, errors))
 }
 
 fn resolve_shader(client: &Client, url: &str) -> Result<(String, String)> {

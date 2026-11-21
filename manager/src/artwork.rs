@@ -16,7 +16,7 @@ pub fn load(game: &Game, custom: Option<&Path>, directory: &Path, limit: u64, re
         let id = game.store_id.as_deref().filter(|id| !id.is_empty() && id.bytes().all(|c| c.is_ascii_digit()))?;
         if game.source != Source::Steam { return None; }
         let url = format!("https://cdn.akamai.steamstatic.com/steam/apps/{id}/library_600x900.jpg");
-        let client = catalog::client().ok()?;
+        let client = catalog::client_with_timeout(std::time::Duration::from_secs(5)).ok()?;
         thumbnail(&catalog::download(&client, &url, 16 * 1024 * 1024).ok()?).ok()
     }).or_else(|| {
         let icon = executable_icon(&game.executable)?;

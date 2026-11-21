@@ -20,7 +20,7 @@ permissions:
 
 concurrency:
   group: manager-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   manager:
@@ -29,13 +29,15 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: cargo-cache
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             manager/target
-          key: manager-windows-${{ hashFiles('manager/Cargo.toml', 'manager/Cargo.lock') }}
+          key: manager-windows-${{ hashFiles('manager/Cargo.toml', 'manager/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: manager-windows-${{ hashFiles('manager/Cargo.toml', 'manager/Cargo.lock') }}-
       - name: Build x86 and x64 PE test fixtures
         working-directory: manager
         shell: pwsh
@@ -64,16 +66,33 @@ jobs:
             } finally { Pop-Location }
           }
           "RESHADE_TEST_FIXTURES=$fixtures" >> $env:GITHUB_ENV
+      - name: Download official setup fixtures
+        run: |
+          $folder = Join-Path $env:RUNNER_TEMP 'official-test-fixtures'
+          New-Item -ItemType Directory -Force $folder | Out-Null
+          foreach ($name in @('ReShade_Setup_6.8.0.exe', 'ReShade_Setup_6.8.0_Addon.exe')) {
+            Invoke-WebRequest "https://reshade.me/downloads/$name" -OutFile (Join-Path $folder $name) -TimeoutSec 40
+          }
+          "RESHADE_UPSTREAM_TEST_ASSETS=$folder" >> $env:GITHUB_ENV
       - name: Build and test native manager
         working-directory: manager
         run: |
-          cargo test --all-targets
+          cargo test --release --all-targets
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo build --release
+      - uses: actions/cache/save@v4
+        if: ${{ !cancelled() && steps.cargo-cache.outputs.cache-primary-key != '' }}
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            manager/target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
       - name: Record executable size and capture native UI
         run: |
           $exe = Get-Item manager/target/release/reshade-manager.exe
           "Portable manager executable: $($exe.Length) bytes" >> $env:GITHUB_STEP_SUMMARY
+          '[![Made with Slint](https://raw.githubusercontent.com/slint-ui/slint/v1.14.1/logo/MadeWithSlint-logo-whitebg.png)](https://slint.dev/)' >> $env:GITHUB_STEP_SUMMARY
           $env:RESHADE_MANAGER_DATA = Join-Path $env:RUNNER_TEMP 'manager-screenshots'
           $process = Start-Process $exe.FullName '--render-fixtures' -PassThru -Wait
           if ($process.ExitCode) { throw 'Slint screenshot capture failed' }
@@ -109,6 +128,7 @@ jobs:
           path: ${{ env.SCREENSHOT_DIR }}/*.png
           if-no-files-found: error
       - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() && hashFiles('manager/Cargo.lock') != '' }}
         with:
           name: Cargo lockfile
           path: manager/Cargo.lock

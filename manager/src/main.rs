@@ -26,7 +26,7 @@ const CATEGORIES: [&str; 10] = [
 struct ViewGame {
     game: Game,
     summary: install::Status,
-    artwork: Option<PathBuf>,
+    artwork: Option<Image>,
 }
 
 struct Session {
@@ -35,6 +35,7 @@ struct Session {
     status: install::Status,
     operation: Operation,
     api: Option<Api>,
+    installed_api: Option<Api>,
     addon: bool,
     acknowledged: bool,
     shaders: Vec<Package>,
@@ -64,6 +65,8 @@ enum Event {
     Stage(String),
     Finished(Result<()>),
     Cache(Result<()>),
+    Legacy(Result<()>),
+    CacheUpdates(Result<String>),
 }
 
 type SharedState = Rc<RefCell<State>>;
@@ -83,7 +86,7 @@ fn game_row(entry: &ViewGame) -> GameRow {
         key: entry.game.key().into(), title: entry.game.title.clone().into(),
         source: entry.game.source.label().into(), status: status_text(&entry.summary).into(),
         installed: entry.summary.wrapper.is_some() || entry.summary.vulkan,
-        art: entry.artwork.as_ref().and_then(|p| Image::load_from_path(p).ok()).unwrap_or_default(),
+        art: entry.artwork.clone().unwrap_or_default(),
     }
 }
 
@@ -103,6 +106,7 @@ fn render_settings(ui: &ManagerWindow, state: &State) {
     let settings = &state.settings;
     ui.set_directories(rows(settings.scan_directories.iter().map(|p| p.to_string_lossy().as_ref().into()).collect()));
     ui.set_scan_on_launch(settings.scan_on_launch);
+    ui.global::<Appearance>().set_high_contrast(settings.high_contrast);
     ui.set_classic(settings.classic);
     ui.set_shared(settings.shared_shaders);
     ui.set_backups(settings.keep_backups);
@@ -190,6 +194,11 @@ fn artwork_jobs(state: &mut State, only: Option<(String, bool)>) {
     }
 }
 
+fn receipt_for_entry(target: &Result<Target>) -> Option<install::Receipt> {
+    let receipt = target.as_ref().ok().and_then(|target| install::receipt(&target.base).ok())?;
+    receipt.game.is_some().then_some(receipt)
+}
+
 fn details(ui: &ManagerWindow, state: &mut State, key: &str) {
     let Some(entry) = state.games.iter_mut().find(|entry| entry.game.key() == key) else { return; };
     let target = pe::analyze(&entry.game.executable, &compatibility(&state.data));
@@ -202,13 +211,16 @@ fn details(ui: &ManagerWindow, state: &mut State, key: &str) {
             if target.banned { text.push_str("\n\nUpstream flags this game as blocked for ReShade."); }
             if !target.notes.is_empty() { text.push_str("\n\n"); text.push_str(&target.notes.join("\n")); }
             if !compat_available { text.push_str("\nCompatibility data is unavailable. Rescan online before changing this installation."); }
+            if entry.summary.wrapper.is_none() && !entry.summary.vulkan && install::receipt(&target.base).is_ok_and(|receipt| receipt.game.is_some()) {
+                text.push_str("\nThe manager found an installation record but the runtime is missing. Use Repair to restore it.");
+            }
             text
         }
         Err(error) => format!("Could not analyze this executable · {error:#}"),
     };
-    let existing = entry.summary.wrapper.is_some() || entry.summary.vulkan;
+    let existing = entry.summary.wrapper.is_some() || entry.summary.vulkan || receipt_for_entry(&target).is_some();
     let usable = target.as_ref().is_ok_and(|t| (!t.banned || existing) && compat_available);
-    let receipt = target.as_ref().ok().and_then(|t| install::receipt(&t.base).ok()).unwrap_or_default();
+    let receipt = receipt_for_entry(&target).unwrap_or_default();
     let api = target.as_ref().ok().and_then(|target| target.api);
     ui.set_game(game_row(entry));
     ui.set_details(explanation.into());
@@ -218,7 +230,7 @@ fn details(ui: &ManagerWindow, state: &mut State, key: &str) {
     ui.set_page(2);
     state.session = Some(Session {
         key: key.to_owned(), target, status: entry.summary.clone(), operation: Operation::Install,
-        api, addon: receipt.addon, acknowledged: false, shaders: vec![], addons: vec![],
+        api, installed_api: receipt.api, addon: receipt.addon, acknowledged: false, shaders: vec![], addons: vec![],
         selection: receipt.selection, expanded: BTreeSet::new(), query: String::new(), category: 0,
         had_selection: receipt.game.is_some(),
     });
@@ -318,6 +330,11 @@ fn load_catalog(ui: &ManagerWindow, state: &State) {
         return;
     }
     if target.banned { ui.set_stage("Upstream flags this game as blocked for ReShade.".into()); return; }
+    if !session.shaders.is_empty() {
+        ui.set_page(5);
+        render_catalog(ui, state);
+        return;
+    }
     let arch = target.arch;
     let want_addons = session.addon;
     let location = state.data.join("metadata");
@@ -361,6 +378,7 @@ fn run_install(ui: &ManagerWindow, state: &State) {
     let limit = state.settings.package_limit_mb.saturating_mul(1_048_576);
     ui.set_busy(true);
     ui.set_page(8);
+    ui.set_progress_phase(0);
     ui.set_stage("Preparing installation…".into());
     thread::spawn(move || {
         let result = pe::analyze(&exe, &compatibility(&data)).and_then(|target| {
@@ -388,7 +406,7 @@ fn handle(ui: &ManagerWindow, state: &mut State, event: Event) {
         }
         Event::Artwork(generation, key, path) if generation == state.artwork_generation => {
             if let Some(entry) = state.games.iter_mut().find(|entry| entry.game.key() == key) {
-                entry.artwork = Some(path);
+                entry.artwork = Image::load_from_path(&path).ok();
                 if ui.get_game().key.as_str() == key { ui.set_game(game_row(entry)); }
             }
             render_games(ui, state);
@@ -411,7 +429,15 @@ fn handle(ui: &ManagerWindow, state: &mut State, event: Event) {
                 render_catalog(ui, state);
             }
         }
-        Event::Stage(stage) => ui.set_stage(stage.into()),
+        Event::Stage(stage) => {
+            let phase = if stage.starts_with("Downloading") { 1 }
+                else if stage.starts_with("Validating") || stage.starts_with("Extracting") { 2 }
+                else if stage.starts_with("Configuring") { 3 }
+                else if stage.starts_with("Installing") || stage.starts_with("Removing") { 4 }
+                else if stage.starts_with("Final") { 5 } else { 0 };
+            ui.set_progress_phase(ui.get_progress_phase().max(phase));
+            ui.set_stage(stage.into());
+        }
         Event::Finished(result) => {
             ui.set_busy(false);
             match result {
@@ -421,6 +447,7 @@ fn handle(ui: &ManagerWindow, state: &mut State, event: Event) {
                             entry.summary = install::status(&target.executable, &target.base);
                         }
                     }
+                    ui.set_progress_phase(5);
                     ui.set_stage("Changes completed and files verified.".into());
                 }
                 Err(error) => {
@@ -428,6 +455,17 @@ fn handle(ui: &ManagerWindow, state: &mut State, event: Event) {
                     ui.set_stage(format!("{error:#}").into());
                 }
             }
+        }
+        Event::Legacy(result) => {
+            ui.set_busy(false);
+            match result {
+                Ok(()) => ui.set_stage("Legacy setup opened. Rescan after making changes there.".into()),
+                Err(error) => report(ui, state, Err(error)),
+            }
+        }
+        Event::CacheUpdates(result) => {
+            ui.set_busy(false);
+            ui.set_stage(match result { Ok(message) => message.into(), Err(error) => format!("{error:#}").into() });
         }
         Event::Cache(result) => {
             ui.set_busy(false);
@@ -444,7 +482,7 @@ fn bind(ui: &ManagerWindow, state: &SharedState) {
             let model = state.clone();
             ui.$name(move |$($arg),*| {
                 if let Some($win) = weak.upgrade() {
-                    let mut borrowed = model.borrow_mut();
+                    let Ok(mut borrowed) = model.try_borrow_mut() else { return; };
                     let $app = &mut *borrowed;
                     $body
                 }
@@ -482,11 +520,31 @@ fn bind(ui: &ManagerWindow, state: &SharedState) {
             } else { ui.set_stage("Choose an x86 or x64 Windows executable.".into()); }
         }
     });
+    ui_callback!(on_contrast_setting, |ui, state, enabled| { state.settings.high_contrast = enabled; save(&ui, state); });
     ui_callback!(on_scan_setting, |ui, state, enabled| { state.settings.scan_on_launch = enabled; save(&ui, state); });
     ui_callback!(on_shared_setting, |ui, state, enabled| { state.settings.shared_shaders = enabled; save(&ui, state); });
     ui_callback!(on_backup_setting, |ui, state, enabled| { state.settings.keep_backups = enabled; save(&ui, state); });
     ui_callback!(on_choose_cache, |ui, state| {
         if let Some(path) = pick_folder() { state.settings.package_directory = Some(path.join("ReShade Downloads")); save(&ui, state); }
+    });
+    ui_callback!(on_check_updates, |ui, state| {
+        let cache = cache(state);
+        let catalog_path = state.data.join("metadata/EffectPackages.ini");
+        let events = state.events.clone();
+        ui.set_busy(true);
+        ui.set_stage("Checking cached package revisions…".into());
+        thread::spawn(move || {
+            let result = (|| -> Result<String> {
+                let packages = catalog::packages(storage::parse_ini(&fs::read_to_string(catalog_path).context("Open an installation's shader catalog first")?), None);
+                let client = catalog::client_with_timeout(Duration::from_secs(5))?;
+                let (updates, errors) = catalog::available_updates(&client, &cache, &packages)?;
+                let mut text = if updates.is_empty() { "No updates found for cached shader packages.".to_owned() }
+                    else { format!("{} updates · {}", updates.len(), updates.join(", ")) };
+                if errors > 0 { text.push_str(&format!(" · {errors} repositories unavailable")); }
+                Ok(text)
+            })();
+            let _ = events.send(Event::CacheUpdates(result));
+        });
     });
     ui_callback!(on_cache_action, |ui, state, action| { clean_cache(&ui, state, Some(action)); });
     ui_callback!(on_set_limits, |ui, state, packages, artwork| {
@@ -519,11 +577,7 @@ fn bind(ui: &ManagerWindow, state: &SharedState) {
         let result = manage_preset(target);
         report(&ui, state, result);
     });
-    ui_callback!(on_legacy, |ui, state| {
-        let Some(session) = &state.session else { return; };
-        let result = legacy_setup(session);
-        report(&ui, state, result);
-    });
+    ui_callback!(on_legacy, |ui, state| { legacy_setup(&ui, state); });
     ui_callback!(on_begin, |ui, state, operation, addon| {
         let Some(session) = state.session.as_mut() else { return; };
         let Ok(target) = &session.target else { return; };
@@ -541,7 +595,7 @@ fn bind(ui: &ManagerWindow, state: &SharedState) {
         }
         session.api = if session.status.vulkan { Some(Api::Vulkan) } else {
             session.status.wrapper.as_ref().and_then(|dll| Api::ALL.into_iter().find(|api| dll.file_stem().is_some_and(|name| name.eq_ignore_ascii_case(api.name()))))
-                .or(target.api)
+                .or(session.installed_api).or(target.api)
         };
         session.acknowledged = false;
         ui.set_addon(session.addon && session.operation != Operation::Uninstall);
@@ -598,6 +652,24 @@ fn bind(ui: &ManagerWindow, state: &SharedState) {
             if let Some(session) = state.session.as_mut() { session.query.clear(); }
             ui.set_page(6); render_catalog(&ui, state);
         } else { review(&ui, state); }
+    });
+    ui_callback!(on_step_back, |ui, state| {
+        let Some(session) = state.session.as_mut() else { return; };
+        let next = match ui.get_page() {
+            3 => 2,
+            4 if session.addon && session.operation != Operation::Uninstall => 3,
+            4 => 2,
+            5 => 4,
+            6 => 5,
+            7 if matches!(session.operation, Operation::Update | Operation::Uninstall) => 4,
+            7 if session.addon => 6,
+            7 => 5,
+            _ => 2,
+        };
+        session.query.clear();
+        ui.set_stage("".into());
+        ui.set_page(next);
+        render_catalog(&ui, state);
     });
     ui_callback!(on_execute, |ui, state| { run_install(&ui, state); });
 }
@@ -659,16 +731,40 @@ fn manage_preset(target: &Target) -> Result<()> {
     storage::atomic_write(&config, text.as_bytes())
 }
 
-fn legacy_setup(session: &Session) -> Result<()> {
-    let target = session.target.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
-    if target.banned { bail!("Upstream flags this game as blocked for ReShade."); }
-    if session.addon && !session.acknowledged { bail!("Start the add-on installation and acknowledge its warning first."); }
-    let Some(setup) = pick_file("Official ReShade setup", &["exe"]) else { return Ok(()); };
-    if !pe::version_string(&setup, "ProductName").is_some_and(|name| name.starts_with("ReShade")) {
-        bail!("Choose an official ReShade setup executable.");
+fn legacy_setup(ui: &ManagerWindow, state: &State) {
+    let Some(session) = &state.session else { return; };
+    let Ok(target) = &session.target else { return; };
+    if target.banned || !state.data.join("metadata/Compatibility.ini").is_file() {
+        ui.set_stage("The compatibility catalog blocks setup or is unavailable. Rescan online to verify the game.".into());
+        return;
     }
-    std::process::Command::new(setup).arg(&target.executable).spawn().context("Open legacy setup")?;
-    Ok(())
+    if session.addon && !session.acknowledged {
+        ui.set_stage("Acknowledge the full add-on warning to open the add-on-enabled installer.".into());
+        return;
+    }
+    let executable = target.executable.clone();
+    let url = install::runtime_url(session.addon);
+    let addon = session.addon;
+    let vulkan = session.api == Some(Api::Vulkan);
+    let cache = cache(state);
+    let setup_folder = state.data.join("legacy-setup");
+    let events = state.events.clone();
+    ui.set_busy(true);
+    ui.set_stage("Verifying the official legacy installer…".into());
+    thread::spawn(move || {
+        let result = (|| -> Result<()> {
+            let client = catalog::client()?;
+            let (cached, bytes) = cache.obtain(&client, &url, false, false, |data| install::verify_distribution(data, addon))?;
+            let setup = setup_folder.join(format!("{}.exe", cached.digest));
+            storage::atomic_write(&setup, &bytes)?;
+            let mut command = std::process::Command::new(setup);
+            command.arg(&executable);
+            if vulkan { command.args(["--api", "vulkan"]); }
+            command.spawn().context("Open the verified ReShade installer")?;
+            Ok(())
+        })();
+        let _ = events.send(Event::Legacy(result));
+    });
 }
 
 fn main() -> Result<()> {
@@ -700,7 +796,7 @@ fn main() -> Result<()> {
     let event_model = state.clone();
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(60), move || {
         if let Some(ui) = weak.upgrade() {
-            let mut state = event_model.borrow_mut();
+            let Ok(mut state) = event_model.try_borrow_mut() else { return; };
             for event in receiver.try_iter().take(12) { handle(&ui, &mut state, event); }
         }
     });
@@ -717,7 +813,7 @@ fn main() -> Result<()> {
     let weak = ui.as_weak();
     let monitor = state.clone();
     automatic.start(slint::TimerMode::Repeated, Duration::from_secs(180), move || {
-        let model = monitor.borrow();
+        let Ok(model) = monitor.try_borrow() else { return; };
         if let Some(ui) = weak.upgrade().filter(|ui| ui.get_page() == 0 && !ui.get_busy() && model.settings.scan_on_launch) {
             scan(&ui, &model);
         }

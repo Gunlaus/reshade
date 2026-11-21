@@ -1,4 +1,17 @@
-import { Button, CheckBox, ComboBox, LineEdit, ScrollView } from "std-widgets.slint";
+import { AboutSlint, Button, CheckBox, ComboBox, LineEdit, ScrollView } from "std-widgets.slint";
+
+export global Appearance {
+    in property <bool> high-contrast;
+    out property <color> text: high-contrast ? #ffffff : #f3f0fc;
+    out property <color> muted: high-contrast ? #f1eef7 : #b4aec7;
+    out property <color> canvas: high-contrast ? #080808 : #11121c;
+    out property <color> sidebar: high-contrast ? #1f1d22 : #171725;
+    out property <color> panel: high-contrast ? #161419 : #191a2a;
+    out property <color> accent: high-contrast ? #d4bbff : #a891f7;
+    out property <color> art-placeholder: high-contrast ? #372853 : #2b2542;
+    out property <color> group: high-contrast ? #362c42 : #25223b;
+    out property <color> installed: high-contrast ? #9cffc6 : #84e3b1;
+}
 
 export struct GameRow {
     key: string,
@@ -19,13 +32,13 @@ export struct CatalogRow {
 }
 
 component Heading inherits Text {
-    color: #f3f0fc;
+    color: Appearance.text;
     font-size: 32px;
     font-weight: 700;
 }
 
 component Subtle inherits Text {
-    color: #b4aec7;
+    color: Appearance.muted;
     font-size: 14px;
     wrap: word-wrap;
 }
@@ -40,7 +53,7 @@ export component ManagerWindow inherits Window {
     preferred-height: 748px;
     min-width: 805px;
     min-height: 595px;
-    background: #11121c;
+    background: Appearance.canvas;
     default-font-family: "Segoe UI";
 
     in property <[GameRow]> games;
@@ -67,6 +80,7 @@ export component ManagerWindow inherits Window {
     in property <bool> backups;
     in property <int> page;
     in property <int> selected-api: -1;
+    in property <int> progress-phase;
     in property <int> filter-index;
     in property <int> selected-category;
 
@@ -85,14 +99,17 @@ export component ManagerWindow inherits Window {
     callback catalog-action(string, int);
     callback review();
     callback execute();
+    callback step-back();
     callback add-location();
     callback remove-location(int);
     callback add-executable();
     callback scan-setting(bool);
+    callback contrast-setting(bool);
     callback shared-setting(bool);
     callback backup-setting(bool);
     callback choose-cache();
     callback cache-action(int);
+    callback check-updates();
     callback set-limits(string, string);
     callback artwork-action(bool);
     callback legacy();
@@ -102,20 +119,21 @@ export component ManagerWindow inherits Window {
     HorizontalLayout {
         Rectangle {
             width: 190px;
-            background: #171725;
+            background: Appearance.sidebar;
             VerticalLayout {
                 padding: 21px;
                 spacing: 12px;
                 HorizontalLayout {
                     spacing: 9px;
                     alignment: start;
-                    Rectangle { width: 8px; height: 24px; border-radius: 4px; background: #a891f7; }
-                    Text { text: "ReShade"; color: #f4efff; font-size: 24px; font-weight: 750; }
+                    Rectangle { width: 8px; height: 24px; border-radius: 4px; background: Appearance.accent; }
+                    Text { text: "ReShade"; color: Appearance.text; font-size: 24px; font-weight: 750; }
                 }
                 Subtle { text: "Game Manager"; }
                 Rectangle { height: 22px; }
                 Button { text: "Game library"; enabled: !root.busy; clicked => { root.navigate(0); } }
                 Button { text: "Settings"; enabled: !root.busy; clicked => { root.navigate(1); } }
+                Button { text: "About"; enabled: !root.busy; clicked => { root.navigate(9); } }
                 Rectangle { vertical-stretch: 1; }
                 Button { text: "Rescan games"; enabled: !root.busy; clicked => { root.rescan(); } }
             }
@@ -135,14 +153,14 @@ export component ManagerWindow inherits Window {
                     ComboBox { width: 155px; model: ["All games", "Installed", "Not installed"]; current-index: root.filter-index; selected => { root.filter(self.current-index); } }
                 }
                 if root.games.length == 0 : Rectangle {
-                    background: #191a2a;
+                    background: Appearance.panel;
                     border-radius: 11px;
                     vertical-stretch: 1;
                     VerticalLayout {
                         padding: 20px;
                         alignment: center;
                         spacing: 10px;
-                        Text { text: root.busy ? "Scanning your libraries" : "No games found"; color: #f3f0fc; font-size: 22px; horizontal-alignment: center; }
+                        Text { text: root.busy ? "Scanning your libraries" : "No games found"; color: Appearance.text; font-size: 22px; horizontal-alignment: center; }
                         Subtle { text: "Try a different filter, rescan, or add a game executable."; horizontal-alignment: center; }
                     }
                 }
@@ -152,7 +170,7 @@ export component ManagerWindow inherits Window {
                         spacing: 8px;
                         for game in root.games : Rectangle {
                             height: 79px;
-                            background: #191a2a;
+                            background: Appearance.panel;
                             border-radius: 10px;
                             HorizontalLayout {
                                 padding: 10px;
@@ -160,20 +178,20 @@ export component ManagerWindow inherits Window {
                                 Rectangle {
                                     width: 88px;
                                     border-radius: 7px;
-                                    background: #2b2542;
+                                    background: Appearance.art-placeholder;
                                     clip: true;
                                     Image { source: game.art; width: parent.width; height: parent.height; image-fit: cover; }
                                 }
                                 VerticalLayout {
                                     alignment: center;
                                     spacing: 3px;
-                                    Text { text: game.title; color: #f3f0fc; font-size: 17px; font-weight: 650; overflow: elide; }
+                                    Text { text: game.title; color: Appearance.text; font-size: 17px; font-weight: 650; overflow: elide; }
                                     Subtle { text: game.source; }
                                 }
                                 Text {
                                     min-width: 146px;
                                     text: (game.installed ? "✓  " : "☑  ") + game.status;
-                                    color: game.installed ? #84e3b1 : #b9b2cb;
+                                    color: game.installed ? Appearance.installed : Appearance.muted;
                                     vertical-alignment: center;
                                     overflow: elide;
                                 }
@@ -210,6 +228,7 @@ export component ManagerWindow inherits Window {
                         HorizontalLayout {
                             spacing: 7px;
                             Button { text: "Choose package cache folder"; enabled: !root.busy; clicked => { root.choose-cache(); } }
+                            Button { text: "Check for updates"; enabled: !root.busy; clicked => { root.check-updates(); } }
                             Button { text: "Clear download cache"; enabled: !root.busy; clicked => { root.cache-action(0); } }
                             Button { text: "Clear artwork cache"; enabled: !root.busy; clicked => { root.cache-action(1); } }
                         }
@@ -219,6 +238,7 @@ export component ManagerWindow inherits Window {
                             artwork := LineEdit { text: root.artwork-limit; placeholder-text: "Artwork limit MB"; }
                             Button { text: "Save limits (MB)"; enabled: !root.busy; clicked => { root.set-limits(package.text, artwork.text); } }
                         }
+                        CheckBox { text: "High contrast"; checked: Appearance.high-contrast; enabled: !root.busy; toggled => { root.contrast-setting(self.checked); } }
                         Button { text: "Open diagnostics"; clicked => { root.diagnostics(); } }
                     }
                 }
@@ -233,7 +253,7 @@ export component ManagerWindow inherits Window {
                     Rectangle {
                         width: 195px;
                         height: 250px;
-                        background: #2b2542;
+                        background: Appearance.art-placeholder;
                         border-radius: 12px;
                         clip: true;
                         Image { source: root.game.art; width: parent.width; height: parent.height; image-fit: cover; }
@@ -311,7 +331,7 @@ export component ManagerWindow inherits Window {
                         for row in root.catalog : Rectangle {
                             min-height: 62px;
                             border-radius: 8px;
-                            background: row.kind == 0 ? #25223b : #191a2a;
+                            background: row.kind == 0 ? Appearance.group : Appearance.panel;
                             HorizontalLayout {
                                 padding: 9px;
                                 spacing: 8px;
@@ -322,7 +342,7 @@ export component ManagerWindow inherits Window {
                                 }
                                 VerticalLayout {
                                     spacing: 2px;
-                                    Text { text: row.title; color: #f3f0fc; font-size: 15px; font-weight: 650; overflow: elide; }
+                                    Text { text: row.title; color: Appearance.text; font-size: 15px; font-weight: 650; overflow: elide; }
                                     Subtle { text: row.subtitle; }
                                 }
                                 if row.kind == 0 : Button { text: row.selected ? "Collapse" : "Expand"; clicked => { root.catalog-action(row.key, 0); } }
@@ -348,14 +368,42 @@ export component ManagerWindow inherits Window {
                 spacing: 14px;
                 Heading { text: root.busy ? "Working on " + root.game.title : "Installation result"; }
                 Subtle { text: root.stage; }
+                Rectangle {
+                    height: 8px;
+                    border-radius: 4px;
+                    background: Appearance.group;
+                    Rectangle {
+                        width: parent.width * min(root.progress-phase, 5) / 5;
+                        height: parent.height;
+                        border-radius: 4px;
+                        background: Appearance.accent;
+                        animate width { duration: 180ms; }
+                    }
+                }
                 Button { text: "Back to game details"; enabled: !root.busy; clicked => { root.open-game(root.game.key); } }
                 Rectangle { vertical-stretch: 1; }
+            }
+
+            if root.page == 9 : VerticalLayout {
+                spacing: 15px;
+                Heading { text: "About ReShade Manager"; }
+                Subtle { text: "Native Windows game library and setup for ReShade."; }
+                HorizontalLayout {
+                    alignment: start;
+                    AboutSlint {}
+                }
+                Rectangle { vertical-stretch: 1; }
+            }
+
+            if root.page >= 3 && root.page <= 7 : HorizontalLayout {
+                alignment: start;
+                Button { text: "Back"; enabled: !root.busy; clicked => { root.step-back(); } }
             }
 
             if root.page != 8 : Text {
                 min-height: 24px;
                 text: root.stage;
-                color: #c1addd;
+                color: Appearance.muted;
                 font-size: 13px;
                 overflow: elide;
                 vertical-alignment: center;
