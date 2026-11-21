@@ -20,7 +20,7 @@ permissions:
 
 concurrency:
   group: manager-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   manager:
@@ -36,8 +36,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             manager/target
-          key: manager-windows-${{ hashFiles('manager/Cargo.toml', 'manager/Cargo.lock') }}-${{ github.run_id }}
-          restore-keys: manager-windows-${{ hashFiles('manager/Cargo.toml', 'manager/Cargo.lock') }}-
+          key: manager-windows-${{ hashFiles('manager/Cargo.toml') }}-${{ github.run_id }}
+          restore-keys: manager-windows-${{ hashFiles('manager/Cargo.toml') }}-
       - name: Build x86 and x64 PE test fixtures
         working-directory: manager
         shell: pwsh
@@ -77,9 +77,9 @@ jobs:
       - name: Build and test native manager
         working-directory: manager
         run: |
-          cargo test --release --all-targets
+          cargo test --locked --release --all-targets
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          cargo build --release
+          cargo build --locked --release
       - uses: actions/cache/save@v4
         if: ${{ !cancelled() && steps.cargo-cache.outputs.cache-primary-key != '' }}
         with:
@@ -139,12 +139,6 @@ jobs:
         with:
           name: ReShade Manager screenshots
           path: ${{ env.SCREENSHOT_DIR }}/*.png
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v7
-        if: ${{ !cancelled() && hashFiles('manager/Cargo.lock') != '' }}
-        with:
-          name: Cargo lockfile
-          path: manager/Cargo.lock
           if-no-files-found: error
 
   legacy-compatibility:

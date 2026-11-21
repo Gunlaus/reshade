@@ -11,7 +11,7 @@ use reshade_manager::{
 };
 use slint::{ComponentHandle, Image, ModelRc, VecModel};
 use std::{
-    cell::RefCell, collections::{BTreeMap, BTreeSet}, fs, path::{Path, PathBuf},
+    cell::RefCell, collections::BTreeSet, fs, path::{Path, PathBuf},
     rc::Rc, sync::mpsc, thread, time::Duration,
 };
 
@@ -60,7 +60,7 @@ struct State {
 }
 
 enum Event {
-    Scanned(Vec<ViewGame>, String),
+    Scanned(Vec<(Game, install::Status)>, String),
     Artwork(u64, String, PathBuf),
     Catalog(Vec<Package>, Vec<Package>, String),
     Stage(String),
@@ -162,7 +162,7 @@ fn scan(ui: &ManagerWindow, state: &State) {
         let metadata = compatibility(&data);
         let games = discovery::discover(&discovery::system_locations(), &settings).into_iter().map(|game| {
             let summary = inspect(&game, &metadata);
-            ViewGame { game, summary, artwork: None }
+            (game, summary)
         }).collect();
         let _ = events.send(Event::Scanned(games, message));
     });
@@ -399,7 +399,7 @@ fn run_install(ui: &ManagerWindow, state: &State) {
 fn handle(ui: &ManagerWindow, state: &mut State, event: Event) {
     match event {
         Event::Scanned(games, note) => {
-            state.games = games;
+            state.games = games.into_iter().map(|(game, summary)| ViewGame { game, summary, artwork: None }).collect();
             let items = state.games.iter().map(|entry| &entry.game).collect::<Vec<_>>();
             if let Err(error) = storage::write_json(&state.data.join("library.json"), &items) { diagnostics(&state.data, &format!("{error:#}")); }
             ui.set_busy(false);
