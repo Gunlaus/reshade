@@ -276,14 +276,15 @@ fn render_catalog(ui: &ManagerWindow, state: &State) {
     let matches = |text: &str| text.to_lowercase().contains(&session.query);
     if ui.get_page() == 6 {
         for package in &session.addons {
-            if !(matches(&package.name) || matches(&package.description) || matches(&package.repository)) { continue; }
+            let category = catalog::addon_category(&package.name);
+            if !(matches(&package.name) || matches(&package.description) || matches(&package.repository) || matches(category)) { continue; }
             let official = package.repository.starts_with("https://github.com/crosire/reshade/") && package.url.starts_with("https://github.com/crosire/");
             let source = if official { "Official example" } else { "Community · upstream curated" };
             let tag = package.url.split("/download/").nth(1).and_then(|s| s.split_once('/')).map(|(tag, _)| tag).unwrap_or("Latest release");
             let cached = if cache.contains(&package.url) { "Cached" } else { "Download required" };
             let arch = session.target.as_ref().map(|t| t.arch.label()).unwrap_or("Unknown");
             result.push(CatalogRow { key: package.id.clone().into(), title: package.name.clone().into(),
-                subtitle: format!("{source} · {tag} · {arch} · {cached}\n{}\n{}", package.description, package.repository).into(),
+                subtitle: format!("{category} · {source} · {tag} · {arch} · {cached}\n{}\n{}", package.description, package.repository).into(),
                 kind: 2, selected: session.selection.addons.contains(&package.id), required: false });
         }
         ui.set_selection_info(format!("{} add-ons selected", session.selection.addons.len()).into());
@@ -767,7 +768,17 @@ fn legacy_setup(ui: &ManagerWindow, state: &State) {
     });
 }
 
-fn main() -> Result<()> {
+fn main() {
+    std::panic::set_hook(Box::new(|info| {
+        if let Ok(data) = storage::data_directory() { diagnostics(&data, &info.to_string()); }
+    }));
+    if let Err(error) = run() {
+        if let Ok(data) = storage::data_directory() { diagnostics(&data, &format!("{error:#}")); }
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let start = std::time::Instant::now();
     if std::env::args().any(|arg| arg == "--render-fixtures") {
         return render_fixtures();
@@ -836,7 +847,9 @@ fn render_fixtures() -> Result<()> {
     slint::platform::set_platform(Box::new(ScreenshotPlatform(window.clone())))
         .map_err(|error| anyhow::anyhow!("{error:?}"))?;
     let ui = ManagerWindow::new()?;
-    ui.window().set_size(slint::PhysicalSize::new(1136, 748));
+    const WIDTH: u32 = 1136;
+    const HEIGHT: u32 = 748;
+    ui.window().set_size(slint::PhysicalSize::new(WIDTH, HEIGHT));
     ui.show()?;
     let directory = storage::data_directory()?;
     fs::create_dir_all(&directory)?;
@@ -848,8 +861,12 @@ fn render_fixtures() -> Result<()> {
     ui.set_game(rows_for_demo[1].clone());
     ui.set_games(rows(rows_for_demo));
     let capture = |name| -> Result<()> {
-        let pixels = ui.window().take_snapshot()?;
-        image::save_buffer(directory.join(name), pixels.as_bytes(), pixels.width(), pixels.height(), image::ColorType::Rgba8)?;
+        let mut pixels = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(WIDTH, HEIGHT);
+        window.request_redraw();
+        if !window.draw_if_needed(|renderer| { renderer.render(pixels.make_mut_slice(), WIDTH as usize); }) {
+            bail!("The software window did not request a frame.");
+        }
+        image::save_buffer(directory.join(name), pixels.as_bytes(), WIDTH, HEIGHT, image::ColorType::Rgb8)?;
         Ok(())
     };
     capture("game-library.png")?;

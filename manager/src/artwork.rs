@@ -12,13 +12,7 @@ pub fn load(game: &Game, custom: Option<&Path>, directory: &Path, limit: u64, re
             if path.metadata().ok()?.len() > 16 * 1024 * 1024 { return None; }
             thumbnail(&fs::read(path).ok()?).ok()
         }).next();
-    let result = local.or_else(|| {
-        let id = game.store_id.as_deref().filter(|id| !id.is_empty() && id.bytes().all(|c| c.is_ascii_digit()))?;
-        if game.source != Source::Steam { return None; }
-        let url = format!("https://cdn.akamai.steamstatic.com/steam/apps/{id}/library_600x900.jpg");
-        let client = catalog::client_with_timeout(std::time::Duration::from_secs(5)).ok()?;
-        thumbnail(&catalog::download(&client, &url, 16 * 1024 * 1024).ok()?).ok()
-    }).or_else(|| {
+    let result = local.or_else(|| online_cover(game)).or_else(|| {
         let icon = executable_icon(&game.executable)?;
         encode(image::DynamicImage::ImageRgba8(icon)).ok()
     });
@@ -31,6 +25,26 @@ pub fn load(game: &Game, custom: Option<&Path>, directory: &Path, limit: u64, re
     } else {
         anyhow::bail!("No artwork is available for {}", game.title)
     }
+}
+
+fn online_cover(game: &Game) -> Option<Vec<u8>> {
+    let id = game.store_id.as_deref().filter(|id| !id.is_empty() && id.bytes().all(|c| c.is_ascii_digit()))?;
+    let client = catalog::client_with_timeout(std::time::Duration::from_secs(5)).ok()?;
+    let url = match game.source {
+        Source::Steam => format!("https://cdn.akamai.steamstatic.com/steam/apps/{id}/library_600x900.jpg"),
+        Source::Gog => {
+            let url = format!("https://api.gog.com/products/{id}");
+            let metadata: serde_json::Value = serde_json::from_slice(&catalog::download(&client, &url, 512 * 1024).ok()?).ok()?;
+            if metadata["id"].as_u64() != id.parse::<u64>().ok() && metadata["id"].as_str() != Some(id) { return None; }
+            let image = ["boxArtImage", "background", "icon"].iter().find_map(|key| metadata["images"][key].as_str())?;
+            let image = if image.starts_with("//") { format!("https:{image}") } else { image.to_owned() };
+            let parsed = reqwest::Url::parse(&image).ok()?;
+            if parsed.scheme() != "https" || !parsed.host_str().is_some_and(catalog::gog_image_host) { return None; }
+            image
+        }
+        _ => return None,
+    };
+    thumbnail(&catalog::download(&client, &url, 16 * 1024 * 1024).ok()?).ok()
 }
 
 fn thumbnail(data: &[u8]) -> Result<Vec<u8>> {

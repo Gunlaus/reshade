@@ -17,7 +17,7 @@ Use **Open legacy setup** for Vulkan's shared Windows layer and for updates of i
 - Direct3D and OpenGL use the original ReShade DLL filename conventions. The DLL is extracted from a SHA-256-pinned official versioned distribution. The manager does not implement a renderer or shader compiler.
 - Downloaded shader ZIPs are keyed by repository URL and resolved commit, and checked against a stored SHA-256 on reuse. Add-ons come from the upstream catalog with release and architecture validation. Publisher digests are checked when GitHub supplies them. An add-on can have separate upstream versions for x86 and x64.
 - Shader packages keep ordinary includes and textures from their selected package. Package layouts outside the shader and texture conventions require inspection before support can be claimed. Selected effects and included assets retain their package-relative paths. Shared storage publishes content into versioned directories and leaves game presets local. Clearing the archive cache leaves live shared resources alone.
-- Steam artwork uses local launcher data or an official Steam CDN URL keyed to the app ID. Epic and GOG use available local metadata. The executable icon is used when artwork is missing.
+- Steam artwork uses local launcher data or an official Steam CDN URL keyed to the app ID. Epic and GOG use available local metadata. GOG can also load a cover from its official product catalog. The executable icon is used when artwork is missing.
 - No telemetry, background service, artwork bundle or shader bundle is shipped.
 
 ## Validation

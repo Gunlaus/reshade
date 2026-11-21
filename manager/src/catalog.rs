@@ -42,6 +42,15 @@ pub fn packages(ini: Ini, addon: Option<Arch>) -> Vec<Package> {
     }).collect()
 }
 
+pub fn addon_category(name: &str) -> &'static str {
+    let name = name.to_ascii_lowercase();
+    if ["capture", "clipboard", "screenshot", "obs"].iter().any(|term| name.contains(term)) { "Capture" }
+    else if ["frame", "display", "window", "swap chain"].iter().any(|term| name.contains(term)) { "Display" }
+    else if ["depth", "hdr", "shader"].iter().any(|term| name.contains(term)) { "Rendering" }
+    else if ["overlay", "input", "freepie"].iter().any(|term| name.contains(term)) { "Input & overlays" }
+    else { "Tools & miscellaneous" }
+}
+
 pub fn category(effect: &str) -> &'static str {
     let effect = effect.to_ascii_lowercase();
     for (name, tokens) in [
@@ -96,13 +105,18 @@ impl Selection {
     }
 }
 
+pub fn gog_image_host(host: &str) -> bool {
+    matches!(host, "images.gog-statics.com" | "images-1.gog-statics.com" | "images-2.gog-statics.com"
+        | "images-3.gog-statics.com" | "images-4.gog-statics.com")
+}
+
 pub fn client() -> Result<Client> { client_with_timeout(Duration::from_secs(45)) }
 
 pub fn client_with_timeout(timeout: Duration) -> Result<Client> {
     Ok(Client::builder().user_agent("ReShade-Manager")
         .connect_timeout(Duration::from_secs(5)).timeout(timeout)
         .https_only(true).redirect(reqwest::redirect::Policy::custom(|attempt| {
-            let trusted = attempt.url().host_str().is_some_and(|host| matches!(host, "reshade.me" | "www.reshade.me" | "github.com" | "api.github.com" | "raw.githubusercontent.com" | "codeload.github.com" | "release-assets.githubusercontent.com" | "objects.githubusercontent.com" | "cdn.akamai.steamstatic.com"));
+            let trusted = attempt.url().host_str().is_some_and(|host| matches!(host, "reshade.me" | "www.reshade.me" | "github.com" | "api.github.com" | "raw.githubusercontent.com" | "codeload.github.com" | "release-assets.githubusercontent.com" | "objects.githubusercontent.com" | "cdn.akamai.steamstatic.com" | "api.gog.com") || gog_image_host(host));
             if trusted && attempt.previous().len() < 8 { attempt.follow() } else { attempt.error("Untrusted redirect destination") }
         })).build()?)
 }

@@ -88,14 +88,31 @@ jobs:
             ~/.cargo/git
             manager/target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
-      - name: Record executable size and capture native UI
+      - name: Record executable size
         run: |
           $exe = Get-Item manager/target/release/reshade-manager.exe
+          Write-Host "Portable manager executable: $($exe.Length) bytes"
           "Portable manager executable: $($exe.Length) bytes" >> $env:GITHUB_STEP_SUMMARY
           '[![Made with Slint](https://raw.githubusercontent.com/slint-ui/slint/v1.14.1/logo/MadeWithSlint-logo-whitebg.png)](https://slint.dev/)' >> $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ReShade Manager Windows
+          path: |
+            manager/target/release/reshade-manager.exe
+            LICENSE.md
+          if-no-files-found: error
+      - name: Capture native UI
+        id: screenshots
+        continue-on-error: true
+        run: |
+          $exe = Get-Item manager/target/release/reshade-manager.exe
           $env:RESHADE_MANAGER_DATA = Join-Path $env:RUNNER_TEMP 'manager-screenshots'
           $process = Start-Process $exe.FullName '--render-fixtures' -PassThru -Wait
-          if ($process.ExitCode) { throw 'Slint screenshot capture failed' }
+          if ($process.ExitCode) {
+            $log = Join-Path $env:RESHADE_MANAGER_DATA 'manager.log'
+            if (Test-Path $log) { Get-Content $log }
+            throw "Slint screenshot command exited with code $($process.ExitCode)"
+          }
           if (!(Test-Path (Join-Path $env:RESHADE_MANAGER_DATA 'game-library.png'))) { throw 'Expected screenshot was not produced' }
           "SCREENSHOT_DIR=$env:RESHADE_MANAGER_DATA" >> $env:GITHUB_ENV
       - name: Sample native startup and idle memory
@@ -111,18 +128,14 @@ jobs:
             $startup = Get-Content $sample
             Start-Sleep -Seconds 2
             $metrics = Get-Process -Id $process.Id
-            "Windows runner sample: ${startup} ms to event loop, $($metrics.WorkingSet64) bytes working set and $($metrics.PrivateMemorySize64) bytes private memory." >> $env:GITHUB_STEP_SUMMARY
+            $status = "Windows runner sample: ${startup} ms to event loop, $($metrics.WorkingSet64) bytes working set and $($metrics.PrivateMemorySize64) bytes private memory."
+            Write-Host $status
+            $status >> $env:GITHUB_STEP_SUMMARY
           } finally {
             if (!$process.HasExited) { Stop-Process -Id $process.Id }
           }
       - uses: actions/upload-artifact@v7
-        with:
-          name: ReShade Manager Windows
-          path: |
-            manager/target/release/reshade-manager.exe
-            LICENSE.md
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v7
+        if: ${{ steps.screenshots.outcome == 'success' }}
         with:
           name: ReShade Manager screenshots
           path: ${{ env.SCREENSHOT_DIR }}/*.png
