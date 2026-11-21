@@ -43,8 +43,38 @@ component Subtle inherits Text {
     wrap: word-wrap;
 }
 
-component AccentButton inherits Button {
-    primary: true;
+component AccentButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    callback clicked;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: root.enabled ? Appearance.accent : Appearance.group;
+    HorizontalLayout {
+        padding: 1px;
+        Button { text: root.text; enabled: root.enabled; clicked => { root.clicked(); } }
+    }
+}
+
+component StatusMark inherits Rectangle {
+    in property <bool> installed;
+    width: 15px;
+    height: 15px;
+    border-radius: 3px;
+    border-color: Appearance.muted;
+    border-width: root.installed ? 0px : 1px;
+    Path {
+        width: parent.width;
+        height: parent.height;
+        viewbox-width: 15;
+        viewbox-height: 15;
+        fill: transparent;
+        stroke: root.installed ? Appearance.installed : Appearance.muted;
+        stroke-width: root.installed ? 2px : 1px;
+        MoveTo { x: 3.5; y: 7.5; }
+        LineTo { x: 6; y: 10; }
+        LineTo { x: 11.5; y: 4.75; }
+    }
 }
 
 export component ManagerWindow inherits Window {
@@ -190,12 +220,16 @@ export component ManagerWindow inherits Window {
                                     Text { text: game.title; color: Appearance.text; font-size: 17px; font-weight: 650; overflow: elide; }
                                     Subtle { text: game.source; }
                                 }
-                                Text {
-                                    min-width: 146px;
-                                    text: (game.installed ? "✓  " : "☑  ") + game.status;
-                                    color: game.installed ? Appearance.installed : Appearance.muted;
-                                    vertical-alignment: center;
-                                    overflow: elide;
+                                HorizontalLayout {
+                                    min-width: 168px;
+                                    spacing: 8px;
+                                    StatusMark { installed: game.installed; }
+                                    Text {
+                                        text: game.status;
+                                        color: game.installed ? Appearance.installed : Appearance.muted;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
                                 }
                                 Button { text: "Manage"; enabled: !root.busy; clicked => { root.open-game(game.key); } }
                             }
