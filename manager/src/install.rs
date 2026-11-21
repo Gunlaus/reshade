@@ -1,0 +1,537 @@
+use crate::{catalog::{self, ArchiveFile, Cache, Package, Selection}, pe::{self, Api, Arch, Target}, storage::{atomic_write, parse_ini, read_json, safe_child, set_ini, sha256, write_json}};
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::{collections::{BTreeMap, BTreeSet}, fs, path::{Path, PathBuf}};
+
+pub const RUNTIME_VERSION: &str = "6.8.0";
+const RECEIPT: &str = ".reshade-manager/installation.json";
+const JOURNAL: &str = ".reshade-manager/transaction.json";
+const WRAPPERS: [&str; 7] = ["d3d9.dll", "dxgi.dll", "d3d10.dll", "d3d11.dll", "d3d12.dll", "opengl32.dll", "ddraw.dll"];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Operation { Install, Update, Repair, Modify, Uninstall }
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct Receipt {
+    pub game: Option<PathBuf>,
+    pub runtime: Option<String>,
+    pub addon: bool,
+    pub selection: Selection,
+    owned: BTreeMap<PathBuf, String>,
+    live_effects: BTreeSet<String>,
+    live_textures: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Status {
+    pub wrapper: Option<PathBuf>,
+    pub version: Option<String>,
+    pub conflict: bool,
+    pub configuration: bool,
+    pub vulkan: bool,
+}
+
+pub fn status(executable: &Path, base: &Path) -> Status {
+    let mut status = Status { configuration: base.join("ReShade.ini").is_file(), ..Status::default() };
+    for name in WRAPPERS {
+        let path = base.join(name);
+        let product = pe::version_string(&path, "ProductName");
+        if product.as_deref() == Some("ReShade") {
+            if status.wrapper.is_some() { status.conflict = true; }
+            status.version = pe::version_string(&path, "ProductVersion");
+            status.wrapper = Some(path);
+        }
+    }
+    if let Some(data) = std::env::var_os("ProgramData") {
+        let global = PathBuf::from(data).join("ReShade");
+        let installed = fs::read_to_string(global.join("ReShadeApps.ini")).ok()
+            .is_some_and(|text| parse_ini(&text).get("").and_then(|values| values.get("apps"))
+                .is_some_and(|paths| paths.split(',').any(|path| same_path(Path::new(path.trim()), executable))));
+        if installed {
+            status.vulkan = true;
+            let number = pe::architecture(executable).map(Arch::number).unwrap_or(64);
+            status.version = pe::version_string(&global.join(format!("ReShade{number}.dll")), "ProductVersion").or(status.version);
+        }
+    }
+    status
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    let a = a.to_string_lossy();
+    let b = b.to_string_lossy();
+    a.trim_start_matches(r"\\?\").eq_ignore_ascii_case(b.trim_start_matches(r"\\?\"))
+}
+
+pub fn receipt(base: &Path) -> Result<Receipt> { read_json(&safe_child(base, Path::new(RECEIPT))?) }
+
+pub fn runtime_url(addon: bool) -> String {
+    let mode = if addon { "_Addon" } else { "" };
+    format!("https://reshade.me/downloads/ReShade_Setup_{RUNTIME_VERSION}{mode}.exe")
+}
+
+pub fn wrapper_name(api: Api) -> Result<String> {
+    if api == Api::Vulkan { bail!("Vulkan uses the legacy setup to manage the shared Windows layer."); }
+    Ok(format!("{}.dll", api.name()))
+}
+
+pub struct Plan<'a> {
+    pub target: &'a Target,
+    pub api: Api,
+    pub addon: bool,
+    pub acknowledged: bool,
+    pub operation: Operation,
+    pub selection: &'a Selection,
+    pub shaders: &'a [Package],
+    pub addons: &'a [Package],
+    pub shared: Option<&'a Path>,
+    pub backups: Option<&'a Path>,
+}
+
+pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) -> Result<()> {
+    let target = plan.target;
+    let base = &target.base;
+    if target.banned && plan.operation != Operation::Uninstall { bail!("Upstream compatibility metadata marks this executable as blocked."); }
+    if plan.addon && !plan.acknowledged && plan.operation != Operation::Uninstall {
+        bail!("Acknowledge the add-on support warning before continuing.");
+    }
+    if target.forced && target.api != Some(plan.api) { bail!("This executable requires its upstream compatibility API."); }
+    let module = PathBuf::from(wrapper_name(plan.api)?);
+    if !base.is_dir() { bail!("The destination directory does not exist."); }
+    let _lock = lock(base)?;
+    recover(base)?;
+    let mut previous = receipt(base)?;
+    if previous.game.as_ref().is_some_and(|exe| !same_path(exe, &target.executable)) {
+        bail!("This directory already contains settings managed for another executable. Select that game to manage its installation.");
+    }
+    let existing = status(&target.executable, base);
+    if existing.conflict || existing.vulkan { bail!("Multiple runtime wrappers or a shared Vulkan layer are present. Resolve the existing installation in legacy setup."); }
+    let destination = safe_child(base, &module)?;
+    if destination.exists() && pe::version_string(&destination, "ProductName").as_deref() != Some("ReShade") {
+        bail!("{} is occupied by another graphics wrapper. Move it manually before installing.", destination.display());
+    }
+    if plan.operation == Operation::Uninstall {
+        progress("Preparing uninstall");
+        let mut changes = BTreeMap::new();
+        if let Some(wrapper) = existing.wrapper {
+            changes.insert(PathBuf::from(wrapper.file_name().context("Missing wrapper filename")?), None);
+        }
+        for (file, checksum) in &previous.owned {
+            if file.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll")) { continue; }
+            let path = safe_child(base, file)?;
+            if fs::read(path).is_ok_and(|bytes| sha256(&bytes) == *checksum) {
+                changes.insert(file.clone(), None);
+            }
+        }
+        let config_path = safe_child(base, Path::new("ReShade.ini"))?;
+        if let Ok(text) = fs::read_to_string(&config_path) {
+            let text = search_path(&text, "EffectSearchPaths", &previous.live_effects, &BTreeSet::new())?;
+            let text = search_path(&text, "TextureSearchPaths", &previous.live_textures, &BTreeSet::new())?;
+            changes.insert("ReShade.ini".into(), Some(text.into_bytes()));
+        }
+        changes.insert(RECEIPT.into(), None);
+        progress("Removing ReShade runtime and verified managed files");
+        return apply(base, changes, plan.backups);
+    }
+
+    let client = catalog::client()?;
+    let mut changes = BTreeMap::new();
+    if plan.operation != Operation::Modify {
+        progress("Downloading or reusing the ReShade distribution");
+        let url = runtime_url(plan.addon);
+        let runtime = |data: &[u8]| extract_runtime(data, target.arch);
+        let (_, data) = cache.obtain(&client, &url, false, false, |d| runtime(d).map(|_| ()))?;
+        progress("Validating the runtime and executable architecture");
+        let dll = runtime(&data)?;
+        changes.insert(module.clone(), Some(dll));
+        if let Some(old) = existing.wrapper {
+            let old_name = PathBuf::from(old.file_name().context("Missing wrapper filename")?);
+            if old_name != module {
+                previous.owned.remove(&old_name);
+                changes.insert(old_name, None);
+            }
+        }
+        previous.runtime = Some(RUNTIME_VERSION.into());
+        previous.addon = plan.addon;
+    }
+    let mut effects = BTreeSet::new();
+    let mut textures = BTreeSet::new();
+    if !matches!(plan.operation, Operation::Update) {
+        let mut owned = BTreeMap::new();
+        for package in plan.shaders {
+            let Some(choice) = plan.selection.shaders.get(&package.id) else { continue; };
+            progress(&format!("Downloading or validating {}", package.name));
+            let (cached, bytes) = cache.obtain(&client, &package.url, true, plan.operation == Operation::Modify,
+                |data| catalog::files(data, shader_file).map(|_| ()))?;
+            progress(&format!("Extracting {}", package.name));
+            let entries = shader_entries(catalog::files(&bytes, shader_file)?, package, choice)?;
+            let private = PathBuf::from(".reshade-manager/library").join(sha256(package.url.as_bytes()));
+            if let Some(shared) = plan.shared {
+                let key = sha256(serde_json::to_vec(&(cached.digest, &package.denied, choice))?.as_slice());
+                let folder = shared.join(key);
+                publish_shared(&folder, &entries)?;
+                if entries.iter().any(|e| e.path.starts_with("Shaders")) { effects.insert(path_setting(&folder.join("Shaders"), true)?); }
+                if entries.iter().any(|e| e.path.starts_with("Textures")) { textures.insert(path_setting(&folder.join("Textures"), true)?); }
+            } else {
+                if entries.iter().any(|e| e.path.starts_with("Shaders")) { effects.insert(path_setting(&Path::new(".").join(&private).join("Shaders"), true)?); }
+                if entries.iter().any(|e| e.path.starts_with("Textures")) { textures.insert(path_setting(&Path::new(".").join(&private).join("Textures"), true)?); }
+                for item in entries {
+                    stage_owned(base, &previous, &mut owned, &mut changes, private.join(item.path), item.bytes)?;
+                }
+            }
+        }
+        if plan.addon {
+            for package in plan.addons.iter().filter(|p| plan.selection.addons.contains(&p.id)) {
+                progress(&format!("Downloading or validating {}", package.name));
+                let (_, bytes) = cache.obtain(&client, &package.url, false, false, |data| addon_entries(package, data, target.arch).map(|_| ()))?;
+                for item in addon_entries(package, &bytes, target.arch)? {
+                    stage_owned(base, &previous, &mut owned, &mut changes, item.path, item.bytes)?;
+                }
+            }
+        }
+        for (file, checksum) in &previous.owned {
+            if owned.contains_key(file) || file.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll")) { continue; }
+            let path = safe_child(base, file)?;
+            if fs::read(path).is_ok_and(|data| sha256(&data) == *checksum) {
+                changes.insert(file.clone(), None);
+            }
+        }
+        previous.owned.retain(|file, _| file.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll")));
+        previous.owned.extend(owned);
+        previous.selection = plan.selection.clone();
+    } else {
+        effects = previous.live_effects.clone();
+        textures = previous.live_textures.clone();
+    }
+
+    progress("Configuring effect and texture search paths");
+    let config_path = safe_child(base, Path::new("ReShade.ini"))?;
+    let original = match fs::read_to_string(config_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error).context("Read existing ReShade.ini"),
+    };
+    let config = configure(&original, target, &previous, &effects, &textures)?;
+    changes.insert("ReShade.ini".into(), Some(config.into_bytes()));
+    if let Some(root) = target.executable.parent().filter(|root| *root != base.as_path()) {
+        if base.parent() != Some(root) { bail!("This compatibility installation target needs legacy setup."); }
+        // The game-level INI is a separate destination. Legacy setup is required to update it atomically.
+        bail!("This game requires ReShade's redirected install directory. Use the legacy installer.");
+    }
+    previous.game = Some(target.executable.clone());
+    previous.live_effects = effects;
+    previous.live_textures = textures;
+    changes.insert(RECEIPT.into(), Some(serde_json::to_vec_pretty(&previous)?));
+    progress("Installing and verifying files");
+    apply(base, changes, plan.backups)?;
+    progress("Final verification complete");
+    Ok(())
+}
+
+fn path_setting(path: &Path, recursive: bool) -> Result<String> {
+    let text = path.to_str().context("ReShade search paths require Unicode paths")?;
+    let text = text.trim_start_matches(r"\\?\").replace('/', "\\");
+    if text.contains([',', '\n', '\r']) { bail!("ReShade cannot represent this search path."); }
+    Ok(if recursive { format!("{text}\\**") } else { text })
+}
+
+fn search_path(text: &str, key: &str, old: &BTreeSet<String>, new: &BTreeSet<String>) -> Result<String> {
+    let ini = parse_ini(text);
+    let raw = ini.get("general").and_then(|s| s.get(&key.to_ascii_lowercase()));
+    if raw.is_none() && new.is_empty() { return Ok(text.to_owned()); }
+    let mut paths = raw.map(String::as_str).unwrap_or(if key == "EffectSearchPaths" { r".\reshade-shaders\Shaders\**" } else { r".\reshade-shaders\Textures\**" })
+        .split(',').map(str::trim).filter(|entry| !entry.is_empty() && !old.contains(*entry)).map(str::to_owned).collect::<Vec<_>>();
+    for path in new {
+        if !paths.contains(path) { paths.push(path.clone()); }
+    }
+    if raw.is_some_and(|current| *current == paths.join(",")) { return Ok(text.to_owned()); }
+    Ok(set_ini(text, "GENERAL", key, &paths.join(",")))
+}
+
+fn configure(original: &str, target: &Target, previous: &Receipt, effects: &BTreeSet<String>, textures: &BTreeSet<String>) -> Result<String> {
+    let mut text = search_path(original, "EffectSearchPaths", &previous.live_effects, effects)?;
+    text = search_path(&text, "TextureSearchPaths", &previous.live_textures, textures)?;
+    let original_ini = parse_ini(original);
+    if !original_ini.get("general").is_some_and(|section| section.contains_key("preprocessordefinitions")) {
+        let value = |key| target.compatibility.get(key).map(String::as_str).unwrap_or("0");
+        let definitions = format!("RESHADE_DEPTH_LINEARIZATION_FAR_PLANE=1000.0,RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN={},RESHADE_DEPTH_INPUT_IS_REVERSED={},RESHADE_DEPTH_INPUT_IS_LOGARITHMIC={}", value("depthupsidedown"), value("depthreversed"), value("depthlogarithmic"));
+        text = set_ini(&text, "GENERAL", "PreprocessorDefinitions", &definitions);
+    }
+    for name in ["DepthCopyBeforeClears", "DepthCopyAtClearIndex", "DrawStatsHeuristic", "UseAspectRatioHeuristics"] {
+        let key = name.to_ascii_lowercase();
+        if let Some(value) = target.compatibility.get(&key).filter(|_| !original_ini.get("depth").is_some_and(|s| s.contains_key(&key))) {
+            text = set_ini(&text, "DEPTH", name, value);
+        }
+    }
+    Ok(text)
+}
+
+fn extract_runtime(data: &[u8], arch: Arch) -> Result<Vec<u8>> {
+    if !data.starts_with(b"MZ") { bail!("The distribution is not an official setup executable."); }
+    let x86 = "ReShade32.dll";
+    let x64 = "ReShade64.dll";
+    let files = catalog::files(data, |n| n == x86 || n == x64)
+        .or_else(|_| {
+            for (offset, block) in data.chunks(512).enumerate() {
+                if block.starts_with(b"PK\x03\x04") {
+                    if let Ok(files) = catalog::files(&data[offset * 512..], |n| n == x86 || n == x64) {
+                        if files.len() == 2 { return Ok(files); }
+                    }
+                }
+            }
+            bail!("Unable to read the ReShade setup archive")
+        })?;
+    if files.len() != 2 { bail!("The setup distribution does not contain both ReShade architectures."); }
+    let mut selected = None;
+    for entry in files {
+        let expected = if entry.path == Path::new(x86) { Arch::X86 } else { Arch::X64 };
+        validate_dll(&entry.bytes, expected, true)?;
+        if expected == arch { selected = Some(entry.bytes); }
+    }
+    selected.context("The selected ReShade architecture is missing")
+}
+
+fn validate_dll(bytes: &[u8], arch: Arch, reshade: bool) -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let dll = temp.path().join("candidate.dll");
+    fs::write(&dll, bytes)?;
+    if pe::architecture(&dll)? != arch { bail!("The downloaded binary has the wrong executable architecture."); }
+    let pe = goblin::pe::PE::parse(bytes)?;
+    if !pe.is_lib { bail!("The downloaded file is not a DLL."); }
+    if reshade && pe::version_string(&dll, "ProductName").as_deref() != Some("ReShade") { bail!("The runtime product metadata did not identify ReShade."); }
+    Ok(())
+}
+
+fn shader_file(name: &str) -> bool {
+    let extension = Path::new(name).extension().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
+    matches!(extension.as_str(), "fx" | "fxh" | "png" | "jpg" | "jpeg" | "bmp" | "dds" | "tga" | "webp" | "tif" | "tiff")
+        || is_license(Path::new(name))
+}
+
+fn is_license(path: &Path) -> bool {
+    let name = path.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
+    name.starts_with("license") || name.starts_with("copying") || name == "notice" || name == "notice.txt"
+}
+
+fn shader_entries(files: Vec<ArchiveFile>, package: &Package, choice: &catalog::Choice) -> Result<Vec<ArchiveFile>> {
+    let mut output = Vec::new();
+    let texture_extensions = ["png", "jpg", "jpeg", "bmp", "dds", "tga", "webp", "tif", "tiff"];
+    let effect_root = find_root(&files, "Shaders", &["fx"]);
+    let texture_root = find_root(&files, "Textures", &texture_extensions);
+    let desired: BTreeSet<_> = choice.effects.iter().map(|name| name.to_ascii_lowercase()).collect();
+    let mut found = BTreeSet::new();
+    for file in files {
+        let path = &file.path;
+        let name = path.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
+        let extension = path.extension().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
+        let mapped = if is_license(path) {
+            Some(PathBuf::from("Licenses").join(path.components().skip(1).collect::<PathBuf>()))
+        } else if texture_extensions.contains(&extension.as_str()) {
+            texture_root.as_ref().and_then(|root| path.strip_prefix(root).ok()).map(|p| Path::new("Textures").join(p))
+        } else if extension == "fx" || extension == "fxh" {
+            if extension == "fx" && (package.denied.iter().any(|e| e.eq_ignore_ascii_case(&name)) || (!choice.all && !desired.contains(&name))) { continue; }
+            effect_root.as_ref().and_then(|root| path.strip_prefix(root).ok()).map(|p| {
+                if extension == "fx" { found.insert(name); }
+                Path::new("Shaders").join(p)
+            })
+        } else { None };
+        if let Some(path) = mapped {
+            safe_child(Path::new("."), &path)?;
+            output.push(ArchiveFile { path, bytes: file.bytes });
+        }
+    }
+    if found.is_empty() || (!choice.all && !desired.is_subset(&found)) {
+        bail!("{} does not contain all selected effects in its supported shader layout.", package.name);
+    }
+    Ok(output)
+}
+
+fn find_root(files: &[ArchiveFile], preferred: &str, extensions: &[&str]) -> Option<PathBuf> {
+    files.iter().filter(|entry| entry.path.extension().is_some_and(|ext| extensions.iter().any(|e| ext.eq_ignore_ascii_case(e))))
+        .filter_map(|entry| {
+            let parent = entry.path.parent()?;
+            let mut search = parent.ancestors();
+            search.find(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(preferred))).map(|p| (false, p))
+                .or_else(|| Some((true, parent)))
+        }).min_by_key(|(fallback, path)| (*fallback, path.components().count())).map(|(_, path)| path.to_owned())
+}
+
+fn addon_entries(package: &Package, bytes: &[u8], arch: Arch) -> Result<Vec<ArchiveFile>> {
+    let url = reqwest::Url::parse(&package.url)?;
+    let filename = url.path_segments().and_then(Iterator::last).context("Add-on filename is missing")?;
+    let ext = format!("addon{}", arch.number());
+    let recognized = |path: &Path| path.extension().is_some_and(|e| e.eq_ignore_ascii_case("addon") || e.eq_ignore_ascii_case(ext.as_str()));
+    let mut files = if recognized(Path::new(filename)) {
+        vec![ArchiveFile { path: filename.into(), bytes: bytes.to_vec() }]
+    } else {
+        catalog::files(bytes, |n| recognized(Path::new(n)) || is_license(Path::new(n)))?
+    };
+    let matching: Vec<_> = files.iter().enumerate().filter(|(_, f)| recognized(&f.path))
+        .filter(|(_, f)| validate_dll(&f.bytes, arch, false).is_ok()).map(|(i, _)| i).collect();
+    let [index] = matching.as_slice() else {
+        bail!("{} has no unique binary for {}.", package.name, arch.label());
+    };
+    let mut module = files.swap_remove(*index);
+    let name = module.path.file_stem().context("Missing add-on name")?;
+    module.path = PathBuf::from(name).with_extension(&ext);
+    let license_dir = Path::new(".reshade-manager/licenses").join(sha256(package.url.as_bytes()));
+    let mut result = vec![module];
+    for file in files.into_iter().filter(|f| is_license(&f.path)) {
+        result.push(ArchiveFile { path: license_dir.join(file.path), bytes: file.bytes });
+    }
+    Ok(result)
+}
+
+fn stage_owned(base: &Path, previous: &Receipt, owned: &mut BTreeMap<PathBuf, String>, changes: &mut BTreeMap<PathBuf, Option<Vec<u8>>>, relative: PathBuf, bytes: Vec<u8>) -> Result<()> {
+    let file = safe_child(base, &relative)?;
+    let checksum = sha256(&bytes);
+    if owned.contains_key(&relative) { bail!("Two packages claim {}", file.display()); }
+    if file.exists() {
+        let current = sha256(&fs::read(&file)?);
+        if previous.owned.get(&relative) != Some(&current) {
+            bail!("{} already exists or has local changes. Move it or keep a private copy before replacing it.", file.display());
+        }
+    }
+    owned.insert(relative.clone(), checksum);
+    changes.insert(relative, Some(bytes));
+    Ok(())
+}
+
+fn publish_shared(folder: &Path, entries: &[ArchiveFile]) -> Result<()> {
+    let parent = folder.parent().context("Invalid live shader storage")?;
+    fs::create_dir_all(parent)?;
+    if !folder.is_dir() {
+        let stage = tempfile::tempdir_in(parent)?;
+        for item in entries { atomic_write(&safe_child(stage.path(), &item.path)?, &item.bytes)?; }
+        if let Err(error) = fs::rename(stage.path(), folder) {
+            if !folder.is_dir() { return Err(error.into()); }
+        }
+    }
+    for item in entries {
+        let path = safe_child(folder, &item.path)?;
+        if sha256(&fs::read(path)?) != sha256(&item.bytes) { bail!("Shared shader files have local changes. Use private shader storage for customized files."); }
+    }
+    Ok(())
+}
+
+fn lock(base: &Path) -> Result<fs::File> {
+    let dir = safe_child(base, Path::new(".reshade-manager"))?;
+    fs::create_dir_all(&dir)?;
+    let file = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+        .open(safe_child(&dir, Path::new("install.lock"))?)?;
+    fs2::FileExt::try_lock_exclusive(&file).context("Another ReShade installation is working in this folder")?;
+    Ok(file)
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct Journal { entries: Vec<Snapshot> }
+
+#[derive(Deserialize, Serialize)]
+struct Snapshot {
+    relative: PathBuf,
+    previous: Option<PathBuf>,
+}
+
+fn recover(base: &Path) -> Result<()> {
+    let journal_path = safe_child(base, Path::new(JOURNAL))?;
+    if !journal_path.is_file() { return Ok(()); }
+    let journal: Journal = read_json(&journal_path)?;
+    for item in journal.entries.into_iter().rev() {
+        let target = safe_child(base, &item.relative)?;
+        match item.previous {
+            Some(backup) => atomic_write(&target, &fs::read(safe_child(base, &backup)?)?)?,
+            None if target.is_file() => fs::remove_file(target)?,
+            None => {}
+        }
+    }
+    fs::remove_file(&journal_path)?;
+    Ok(())
+}
+
+fn apply(base: &Path, changes: BTreeMap<PathBuf, Option<Vec<u8>>>, backups: Option<&Path>) -> Result<()> {
+    let staging_relative = Path::new(".reshade-manager/rollback");
+    let staging = safe_child(base, staging_relative)?;
+    fs::create_dir_all(&staging)?;
+    let mut journal = Journal::default();
+    for (index, relative) in changes.keys().enumerate() {
+        let path = safe_child(base, relative)?;
+        let backup = if path.exists() {
+            if !path.is_file() { bail!("{} is not a regular file.", path.display()); }
+            let relative_backup = staging_relative.join(format!("{index}.previous"));
+            atomic_write(&safe_child(base, &relative_backup)?, &fs::read(&path)?)?;
+            Some(relative_backup)
+        } else { None };
+        journal.entries.push(Snapshot { relative: relative.clone(), previous: backup });
+    }
+    let journal_path = safe_child(base, Path::new(JOURNAL))?;
+    write_json(&journal_path, &journal)?;
+    let result = (|| -> Result<()> {
+        if let Some(backup) = backups {
+            fs::create_dir_all(backup)?;
+            let snapshot = tempfile::Builder::new().prefix("installation-").tempdir_in(backup)?;
+            for item in &journal.entries {
+                if let Some(file) = &item.previous {
+                    atomic_write(&safe_child(snapshot.path(), &item.relative)?, &fs::read(safe_child(base, file)?)?)?;
+                }
+            }
+            let _ = snapshot.keep();
+        }
+        for (file, bytes) in &changes {
+            let path = safe_child(base, file)?;
+            match bytes {
+                Some(bytes) => {
+                    atomic_write(&path, bytes)?;
+                    if sha256(&fs::read(&path)?) != sha256(bytes) { bail!("Verification failed for {}", path.display()); }
+                }
+                None if path.is_file() => fs::remove_file(path)?,
+                None => {}
+            }
+        }
+        fs::remove_file(&journal_path)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        recover(base).with_context(|| format!("{error:#}. Recovery is pending in {}", base.display()))?;
+        return Err(error).context("Changes were rolled back");
+    }
+    let _ = fs::remove_dir_all(staging);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn recovers_interrupted_change_and_keeps_preset() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let stage = base.join(".reshade-manager/rollback");
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(stage.join("x"), "old").unwrap();
+        fs::write(base.join("dxgi.dll"), "new").unwrap();
+        fs::write(base.join("Preset.ini"), "my settings").unwrap();
+        write_json(&base.join(JOURNAL), &Journal { entries: vec![Snapshot { relative: "dxgi.dll".into(), previous: Some(".reshade-manager/rollback/x".into()) }] }).unwrap();
+        recover(base).unwrap();
+        assert_eq!(fs::read_to_string(base.join("dxgi.dll")).unwrap(), "old");
+        assert_eq!(fs::read_to_string(base.join("Preset.ini")).unwrap(), "my settings");
+    }
+
+    #[test]
+    fn shader_selection_retains_includes_and_textures() {
+        let files = ["repo/Shaders/A.fx", "repo/Shaders/B.fx", "repo/Shaders/Common.fxh", "repo/Textures/LUT.png"]
+            .into_iter().map(|path| ArchiveFile { path: path.into(), bytes: vec![1] }).collect();
+        let package = Package { id: "1".into(), name: "test".into(), description: "".into(), repository: "".into(), url: "".into(), effects: vec![], denied: vec![], required: false, enabled: false, addon: false };
+        let choice = catalog::Choice { all: false, effects: BTreeSet::from(["A.fx".into()]) };
+        let entries = shader_entries(files, &package, &choice).unwrap();
+        assert_eq!(entries.iter().map(|entry| entry.path.clone()).collect::<Vec<_>>(),
+            ["Shaders/A.fx", "Shaders/Common.fxh", "Textures/LUT.png"].map(PathBuf::from));
+    }
+
+    #[test]
+    fn managed_search_paths_keep_the_games_own_paths() {
+        let original = "[GENERAL]\nPresetPath=MyPreset.ini\nEffectSearchPaths=Custom,OldShared\n";
+        let new = search_path(original, "EffectSearchPaths", &BTreeSet::from(["OldShared".into()]), &BTreeSet::from(["NewShared".into()])).unwrap();
+        let ini = parse_ini(&new);
+        assert_eq!(ini["general"]["presetpath"], "MyPreset.ini");
+        assert_eq!(ini["general"]["effectsearchpaths"], "Custom,NewShared");
+    }
+}
