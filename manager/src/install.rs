@@ -22,6 +22,7 @@ pub struct Receipt {
     pub api: Option<Api>,
     pub addon: bool,
     pub selection: Selection,
+    pub selection_managed: bool,
     owned: BTreeMap<PathBuf, String>,
     live_effects: BTreeSet<String>,
     live_textures: BTreeSet<String>,
@@ -68,6 +69,20 @@ fn same_path(a: &Path, b: &Path) -> bool {
 }
 
 pub fn receipt(base: &Path) -> Result<Receipt> { read_json(&safe_child(base, Path::new(RECEIPT))?) }
+
+pub fn adopt(target: &Target, addon: bool) -> Result<()> {
+    let base = &target.base;
+    let root = target.executable.parent().context("The executable has no parent directory")?;
+    let _lock = lock(root)?;
+    recover(root)?;
+    if receipt(base)?.game.is_some() { bail!("This directory already has an installation record."); }
+    let status = status(&target.executable, base);
+    if status.conflict || status.vulkan { bail!("Open legacy setup to manage this shared layer or wrapper conflict."); }
+    let wrapper = status.wrapper.context("No ReShade runtime was found.")?;
+    let api = Api::ALL.into_iter().find(|api| wrapper.file_stem().is_some_and(|name| name.eq_ignore_ascii_case(api.name())));
+    let imported = Receipt { game: Some(target.executable.clone()), runtime: status.version, api, addon, ..Receipt::default() };
+    write_json(&safe_child(base, Path::new(RECEIPT))?, &imported)
+}
 
 pub fn runtime_url(addon: bool) -> String {
     let mode = if addon { "_Addon" } else { "" };
@@ -184,8 +199,11 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
         previous.addon = plan.addon;
     }
     let mut effects = BTreeSet::new();
+    let mut effect_names = BTreeSet::new();
     let mut textures = BTreeSet::new();
-    if !matches!(plan.operation, Operation::Update) {
+    let manage_content = matches!(plan.operation, Operation::Install | Operation::Modify)
+        || (plan.operation == Operation::Repair && previous.selection_managed);
+    if manage_content {
         let mut owned = BTreeMap::new();
         for package in plan.shaders {
             let Some(choice) = plan.selection.shaders.get(&package.id) else { continue; };
@@ -194,6 +212,14 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
                 |data| catalog::files(data, shader_file).map(|_| ()))?;
             progress(&format!("Extracting {}", package.name));
             let entries = shader_entries(catalog::files(&bytes, shader_file)?, package, choice)?;
+            for entry in &entries {
+                if entry.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("fx")) {
+                    let name = entry.path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                    if !effect_names.insert(name.clone()) {
+                        bail!("More than one selected shader package provides {name}. Adjust the catalog selection.");
+                    }
+                }
+            }
             let private = PathBuf::from(".reshade-manager/library").join(sha256(package.url.as_bytes()));
             if let Some(shared) = plan.shared {
                 let key = sha256(serde_json::to_vec(&(cached.digest, &package.denied, choice))?.as_slice());
@@ -234,6 +260,7 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
         previous.owned.retain(|file, _| file.extension().is_some_and(|e| e.eq_ignore_ascii_case("dll")));
         previous.owned.extend(owned);
         previous.selection = plan.selection.clone();
+        previous.selection_managed = true;
     } else {
         effects = previous.live_effects.clone();
         textures = previous.live_textures.clone();
@@ -242,6 +269,9 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
     progress("Configuring effect and texture search paths");
     let config_path = safe_child(base, Path::new("ReShade.ini"))?;
     let original = optional_config(&config_path)?;
+    if !effect_names.is_empty() {
+        check_existing_effects(base, &original, &previous.live_effects, &effect_names)?;
+    }
     let config = if plan.operation == Operation::Update && !original.is_empty() {
         original
     } else {
@@ -305,6 +335,25 @@ fn search_path(text: &str, key: &str, old: &BTreeSet<String>, new: &BTreeSet<Str
     }
     if raw.is_some_and(|current| *current == paths.join(",")) { return Ok(text.to_owned()); }
     Ok(set_ini(text, "GENERAL", key, &paths.join(",")))
+}
+
+fn check_existing_effects(base: &Path, config: &str, old_paths: &BTreeSet<String>, desired: &BTreeSet<String>) -> Result<()> {
+    let ini = parse_ini(config);
+    let paths = ini.get("general").and_then(|s| s.get("effectsearchpaths")).map(String::as_str)
+        .unwrap_or(r".\reshade-shaders\Shaders\**");
+    for path in paths.split(',').map(str::trim).filter(|p| !p.is_empty() && !old_paths.contains(*p)) {
+        let (path, recursive) = path.strip_suffix(r"\**").or_else(|| path.strip_suffix("/**")).map_or((path, false), |p| (p, true));
+        let path = base.join(path);
+        if !path.is_dir() { continue; }
+        for entry in walkdir::WalkDir::new(path).follow_links(false).max_depth(if recursive { 16 } else { 1 })
+            .into_iter().take(20_000).filter_map(Result::ok) {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if entry.file_type().is_file() && desired.contains(&name) {
+                bail!("A selected effect already exists at {}. Deselect that effect to keep using this copy.", entry.path().display());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn configure(original: &str, target: &Target, previous: &Receipt, effects: &BTreeSet<String>, textures: &BTreeSet<String>) -> Result<String> {
@@ -673,6 +722,15 @@ mod tests {
             assert!(!base.join("sample.addon64").exists());
             assert!(fs::read_to_string(base.join("ReShade.ini")).unwrap().contains(&format!("PresetPath={name}.ini")));
             assert_eq!(fs::read_to_string(base.join(format!("{name}.ini"))).unwrap(), format!("[custom]\nName={name}\n"));
+            if !full {
+                let config = fs::read(base.join("ReShade.ini")).unwrap();
+                fs::write(base.join("dxgi.dll"), &normal64).unwrap();
+                adopt(&target, false).unwrap();
+                assert_eq!(fs::read(base.join("ReShade.ini")).unwrap(), config);
+                assert!(!receipt(&base).unwrap().selection_managed);
+                run(Operation::Repair, true).unwrap();
+                run(Operation::Uninstall, true).unwrap();
+            }
         }
         assert_eq!(fs::read_dir(root.join("shared")).unwrap().count(), 1);
         assert_eq!(cache.stats().0, 4);

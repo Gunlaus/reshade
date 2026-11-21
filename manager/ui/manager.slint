@@ -72,6 +72,7 @@ export component ManagerWindow inherits Window {
     in property <string> operation;
     in property <bool> installed;
     in property <bool> usable;
+    in property <bool> can-import;
     in property <bool> busy;
     in property <bool> addon;
     in property <bool> classic;
@@ -113,6 +114,7 @@ export component ManagerWindow inherits Window {
     callback set-limits(string, string);
     callback artwork-action(bool);
     callback legacy();
+    callback import-existing(bool);
     callback presets();
     callback diagnostics();
 
@@ -286,6 +288,15 @@ export component ManagerWindow inherits Window {
                         Button { text: "Modify shaders"; enabled: root.usable && !root.busy; clicked => { root.begin("Modify", false); } }
                         Button { text: "Presets"; enabled: !root.busy; clicked => { root.presets(); } }
                         Button { text: "Uninstall"; enabled: root.usable && !root.busy; clicked => { root.begin("Uninstall", false); } }
+                    }
+                }
+                if root.can-import : VerticalLayout {
+                    spacing: 6px;
+                    Subtle { text: "Choose the installed runtime variant to import it. Import leaves the game’s files and presets in place."; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Button { text: "Import standard runtime"; enabled: !root.busy; clicked => { root.import-existing(false); } }
+                        Button { text: "Import full add-on runtime"; enabled: !root.busy; clicked => { root.import-existing(true); } }
                     }
                 }
                 Button { text: "Open legacy setup"; enabled: !root.busy; clicked => { root.legacy(); } }

@@ -186,7 +186,7 @@ pub fn executable(path: &Path) -> bool {
 }
 
 fn game_executables(root: &Path, depth: usize) -> impl Iterator<Item = PathBuf> + '_ {
-    WalkDir::new(root).max_depth(depth).follow_links(false).into_iter().filter_entry(|item| {
+    WalkDir::new(root).max_depth(depth).follow_links(false).follow_root_links(false).into_iter().filter_entry(|item| {
         if item.depth() == 0 { return true; }
         let name = item.file_name().to_string_lossy().to_ascii_lowercase();
         !matches!(name.as_str(), "redist" | "_commonredist" | "prerequisites" | "easyanticheat" | "battleye" | "engine" | "installer" | "crashreportclient")

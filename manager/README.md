@@ -8,7 +8,7 @@ Download the Windows manager artifact from this fork's **ReShade Manager Windows
 
 The app stores settings and its library under `%LOCALAPPDATA%\ReShade Manager`. `RESHADE_MANAGER_DATA` can point to a separate directory for portable storage, testing, or diagnostics. Files installed by the manager are tracked in a receipt alongside the game. Each game retains its own ReShade.ini and presets. Uninstall removes a recognized ReShade wrapper and unmodified files recorded in its receipt. Existing configurations, presets and custom resources stay in place.
 
-Use **Open legacy setup** for Vulkan's shared Windows layer and for updates of imported installations whose original runtime variant cannot be determined. It downloads and opens the pinned upstream setup executable. The official website supplies standard and add-on-enabled setup executables. The fork's compatibility job also builds a legacy fallback from source.
+To import an existing direct-wrapper installation, confirm its runtime variant on the game details screen. Import records the wrapper and leaves existing files in place. Use **Open legacy setup** for Vulkan's shared Windows layer. It downloads and opens the pinned upstream setup executable. The official website supplies standard and add-on-enabled setup executables. The fork's compatibility job also builds a legacy fallback from source.
 
 ## Compatibility and storage
 

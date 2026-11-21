@@ -45,6 +45,7 @@ struct Session {
     query: String,
     category: usize,
     had_selection: bool,
+    manages_content: bool,
 }
 
 struct State {
@@ -226,13 +227,14 @@ fn details(ui: &ManagerWindow, state: &mut State, key: &str) {
     ui.set_details(explanation.into());
     ui.set_installed(existing);
     ui.set_usable(usable);
+    ui.set_can_import(existing && receipt.game.is_none() && !entry.summary.vulkan && !entry.summary.conflict);
     ui.set_stage("".into());
     ui.set_page(2);
     state.session = Some(Session {
         key: key.to_owned(), target, status: entry.summary.clone(), operation: Operation::Install,
         api, installed_api: receipt.api, addon: receipt.addon, acknowledged: false, shaders: vec![], addons: vec![],
         selection: receipt.selection, expanded: BTreeSet::new(), query: String::new(), category: 0,
-        had_selection: receipt.game.is_some(),
+        had_selection: receipt.game.is_some(), manages_content: receipt.selection_managed,
     });
 }
 
@@ -259,7 +261,7 @@ fn review(ui: &ManagerWindow, state: &State) {
             if cache(state).contains(&url) { "cached" } else { "download required" })
     };
     let mut summary = format!("{}\n{} · {}\n\n{}\n\nDestination\n{}\n", ui.get_game().title, api.label(), target.arch.label(), runtime, target.base.display());
-    if matches!(session.operation, Operation::Install | Operation::Modify | Operation::Repair) {
+    if matches!(session.operation, Operation::Install | Operation::Modify) || (session.operation == Operation::Repair && session.manages_content) {
         summary.push_str(&format!("\nShader packages\n{}\n\nAdd-ons\n{}",
             display(&session.shaders, &|p| session.selection.shaders.contains_key(&p.id)),
             display(&session.addons, &|p| session.selection.addons.contains(&p.id))));
@@ -309,7 +311,7 @@ fn render_catalog(ui: &ManagerWindow, state: &State) {
             if open {
                 for effect in visible_effects {
                     result.push(CatalogRow { key: format!("{}|{effect}", package.id).into(), title: effect.as_str().into(),
-                        subtitle: if state.settings.classic { "Effect".into() } else { catalog::category(effect).into() },
+                        subtitle: if state.settings.classic { "Effect".into() } else { format!("{} · No upstream description", catalog::category(effect)).into() },
                         kind: 1, selected: session.selection.effect_selected(package, effect), required: package.required });
                 }
             }
@@ -326,7 +328,7 @@ fn load_catalog(ui: &ManagerWindow, state: &State) {
         ui.set_stage("Use legacy setup for the shared Vulkan layer.".into());
         return;
     }
-    if matches!(session.operation, Operation::Update | Operation::Uninstall) {
+    if matches!(session.operation, Operation::Update | Operation::Uninstall) || (session.operation == Operation::Repair && !session.manages_content) {
         review(ui, state);
         return;
     }
@@ -578,6 +580,18 @@ fn bind(ui: &ManagerWindow, state: &SharedState) {
         let result = manage_preset(target);
         report(&ui, state, result);
     });
+    ui_callback!(on_import_existing, |ui, state, addon| {
+        let Some(session) = state.session.as_ref() else { return; };
+        let key = session.key.clone();
+        let Ok(target) = &session.target else { return; };
+        match install::adopt(target, addon) {
+            Ok(()) => {
+                details(&ui, state, &key);
+                ui.set_stage("Installation imported. Existing files and presets were preserved.".into());
+            }
+            Err(error) => report(&ui, state, Err(error)),
+        }
+    });
     ui_callback!(on_legacy, |ui, state| { legacy_setup(&ui, state); });
     ui_callback!(on_begin, |ui, state, operation, addon| {
         let Some(session) = state.session.as_mut() else { return; };
@@ -591,8 +605,8 @@ fn bind(ui: &ManagerWindow, state: &SharedState) {
         }
         if session.operation == Operation::Install {
             session.addon = addon;
-        } else if !session.had_selection && matches!(session.operation, Operation::Update | Operation::Repair) {
-            ui.set_stage("For an imported installation, open legacy setup to preserve its runtime variant.".into()); return;
+        } else if !session.had_selection && matches!(session.operation, Operation::Update | Operation::Repair | Operation::Modify) {
+            ui.set_stage("Import the existing runtime and confirm its variant first.".into()); return;
         }
         session.api = if session.status.vulkan { Some(Api::Vulkan) } else {
             session.status.wrapper.as_ref().and_then(|dll| Api::ALL.into_iter().find(|api| dll.file_stem().is_some_and(|name| name.eq_ignore_ascii_case(api.name()))))
@@ -662,7 +676,7 @@ fn bind(ui: &ManagerWindow, state: &SharedState) {
             4 => 2,
             5 => 4,
             6 => 5,
-            7 if matches!(session.operation, Operation::Update | Operation::Uninstall) => 4,
+            7 if matches!(session.operation, Operation::Update | Operation::Uninstall) || (session.operation == Operation::Repair && !session.manages_content) => 4,
             7 if session.addon => 6,
             7 => 5,
             _ => 2,
