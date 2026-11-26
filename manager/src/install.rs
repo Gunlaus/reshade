@@ -158,8 +158,9 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
         bail!("This directory already contains settings managed for another executable. Select that game to manage its installation.");
     }
     let existing = status(&target.executable, base);
-    if plan.operation == Operation::Update && existing.version.as_deref().is_some_and(is_newer_than_distribution) {
-        bail!("The installed runtime is newer than the manager’s pinned distribution.");
+    if matches!(plan.operation, Operation::Update | Operation::Repair)
+        && existing.version.as_deref().or(previous.runtime.as_deref()).is_some_and(is_newer_than_distribution) {
+        bail!("This game uses a newer ReShade version. Use the installer for that version to repair or update it.");
     }
     if existing.conflict || existing.vulkan { bail!("Multiple runtime wrappers or a shared Vulkan layer are present. Resolve the existing installation in legacy setup."); }
     let destination = safe_child(base, &module)?;
@@ -190,6 +191,15 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
         return apply(root, relocate(changes, prefix), plan.backups);
     }
 
+    let manage_content = matches!(plan.operation, Operation::Install | Operation::Modify)
+        || (plan.operation == Operation::Repair && previous.selection_managed);
+    if manage_content {
+        check_catalog_selection(plan.selection, plan.shaders, plan.addons)?;
+    }
+    if plan.operation == Operation::Modify && existing.wrapper.is_none() {
+        bail!("The ReShade runtime is missing. Repair the installation before changing shader packages.");
+    }
+
     let client = catalog::client()?;
     let mut changes = BTreeMap::new();
     if plan.operation != Operation::Modify {
@@ -214,8 +224,6 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
     let mut effects = BTreeSet::new();
     let mut effect_names = BTreeSet::new();
     let mut textures = BTreeSet::new();
-    let manage_content = matches!(plan.operation, Operation::Install | Operation::Modify)
-        || (plan.operation == Operation::Repair && previous.selection_managed);
     if manage_content {
         let mut owned = BTreeMap::new();
         for package in plan.shaders {
@@ -305,6 +313,16 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
     progress("Installing and verifying files");
     apply(root, changes, plan.backups)?;
     progress("Final verification complete");
+    Ok(())
+}
+
+pub fn check_catalog_selection(selection: &Selection, shaders: &[Package], addons: &[Package]) -> Result<()> {
+    if selection.shaders.keys().any(|id| !shaders.iter().any(|package| &package.id == id)) {
+        bail!("A selected shader package is unavailable. Your installed files are safe.");
+    }
+    if selection.addons.iter().any(|id| !addons.iter().any(|package| &package.id == id)) {
+        bail!("A selected add-on is unavailable. Your installed files are safe.");
+    }
     Ok(())
 }
 
@@ -636,6 +654,17 @@ fn apply(base: &Path, changes: BTreeMap<PathBuf, Option<Vec<u8>>>, backups: Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn missing_catalog_entries_cannot_remove_selected_packages() {
+        let mut selection = Selection::default();
+        assert!(check_catalog_selection(&selection, &[], &[]).is_ok());
+        selection.shaders.insert("saved-shader".into(), Default::default());
+        assert!(check_catalog_selection(&selection, &[], &[]).unwrap_err().to_string().contains("shader"));
+        selection.shaders.clear();
+        selection.addons.insert("saved-add-on".into());
+        assert!(check_catalog_selection(&selection, &[], &[]).unwrap_err().to_string().contains("add-on"));
+    }
+
     #[test]
     fn recovers_interrupted_change_and_keeps_preset() {
         let dir = tempfile::tempdir().unwrap();

@@ -6,17 +6,17 @@ The portable manager shares the ReShade runtime and content catalogs with upstre
 
 Choose a game in the library to see its status and next action. **Set up ReShade** opens a review when the renderer is known. From the review you can change the renderer or choose packages. The full add-on edition, artwork controls, and less common maintenance actions are in **More options**.
 
-Scanning uses local game files first and refreshes compatibility information in the background. A missing manually added game stays in the library so you can reconnect its drive or add a relocated executable. Removing that entry only clears the manual library reference.
+Scanning uses local game files first and refreshes compatibility information in the background. A missing manually added game stays in the library so you can reconnect its drive or add a relocated executable. Adding a relocated executable selects the new entry. Removing the old entry only clears its manual library reference.
 
 A failed install keeps your review and selections available. If the shader catalog cannot load and a standard runtime is already cached, a new standard installation can explicitly use the runtime on its own.
 
-## Using the manager
+## Download and storage locations
 
 Download the Windows manager artifact from this fork's **ReShade Manager Windows** Actions workflow. Run `reshade-manager.exe` and select an installed game. Review the executable and graphics API before choosing shaders or add-ons. Setup downloads the corresponding ReShade runtime from reshade.me and does not start the game.
 
 The app stores settings and its library under `%LOCALAPPDATA%\ReShade Manager`. `RESHADE_MANAGER_DATA` can point to a separate directory for portable storage, testing, or diagnostics. Files installed by the manager are tracked in a receipt alongside the game. Each game retains its own ReShade.ini and presets. Uninstall removes a recognized ReShade wrapper and unmodified files recorded in its receipt. Existing configurations, presets and custom resources stay in place.
 
-To import an existing direct-wrapper installation, confirm its runtime variant on the game details screen. Import records the wrapper and leaves existing files in place. Use **Open legacy setup** for Vulkan's shared Windows layer. It downloads and opens the pinned upstream setup executable. The official website supplies standard and add-on-enabled setup executables. The fork's compatibility job also builds a legacy fallback from source.
+To import an existing direct-wrapper installation, confirm its runtime variant on the game details screen. Import records the wrapper and leaves existing files in place. Use **Open official setup** for Vulkan's shared Windows layer. It downloads and opens the pinned upstream setup executable. The official website supplies standard and add-on-enabled setup executables. The fork's compatibility job also builds a legacy fallback from source.
 
 ## Compatibility and storage
 

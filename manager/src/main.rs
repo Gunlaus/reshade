@@ -59,6 +59,7 @@ struct State {
     events: mpsc::Sender<Event>,
     artwork_generation: u64,
     checking_compatibility: bool,
+    select_after_scan: Option<PathBuf>,
 }
 
 enum Event {
@@ -352,6 +353,12 @@ fn review(ui: &ManagerWindow, state: &State) {
             display(&session.shaders, &|p| session.selection.shaders.contains_key(&p.id)),
             display(&session.addons, &|p| session.selection.addons.contains(&p.id))));
     }
+    let problem = if wants_content(session) {
+        install::check_catalog_selection(&session.selection, &session.shaders, &session.addons)
+            .err().map(|error| format!("{error} Open the package list to review the unavailable selection."))
+            .unwrap_or_default()
+    } else { String::new() };
+    ui.set_review_problem(problem.into());
     ui.set_can_edit_renderer(session.operation == Operation::Install && !target.forced);
     ui.set_can_edit_content(wants_content(session) && !session.runtime_only);
     ui.set_summary(summary.into());
@@ -405,6 +412,18 @@ fn render_catalog(ui: &ManagerWindow, state: &State) {
             }
         }
         ui.set_selection_info(format!("{} packages selected", session.selection.shaders.len()).into());
+    }
+    let (selected, available): (Vec<_>, _) = if ui.get_page() == 6 {
+        (session.selection.addons.iter().collect(), &session.addons)
+    } else {
+        (session.selection.shaders.keys().collect(), &session.shaders)
+    };
+    for id in selected.into_iter().filter(|id| !available.iter().any(|package| &package.id == *id)) {
+        if matches(id) {
+            result.push(CatalogRow { key: id.clone().into(), title: format!("Unavailable package {id}").into(),
+                subtitle: "Clear this selection only if you want to remove its managed files.".into(),
+                kind: 2, selected: true, required: false });
+        }
     }
     ui.set_catalog(rows(result));
 }
@@ -522,8 +541,16 @@ fn handle(ui: &ManagerWindow, state: &mut State, event: Event) {
                 diagnostics(&state.data, &format!("{error:#}"));
             }
             ui.set_scanning(false);
-            let key = ui.get_game().key;
-            if ui.get_page() == 2 && !ui.get_busy() {
+            let desired = state.select_after_scan.take().and_then(|path| state.games.iter()
+                .find(|entry| same_executable(&entry.game.executable, &path)).map(|entry| entry.game.key()));
+            if let Some(key) = desired.filter(|_| ui.get_page() <= 2 && !ui.get_busy()) {
+                state.query.clear();
+                state.filter = 0;
+                ui.set_library_query("".into());
+                ui.set_filter_index(0);
+                details(ui, state, &key);
+            } else if ui.get_page() == 2 && !ui.get_busy() {
+                let key = ui.get_game().key;
                 if state.games.iter().any(|entry| entry.game.key() == key.as_str()) {
                     details(ui, state, key.as_str());
                 } else {
@@ -733,7 +760,12 @@ fn bind(ui: &ManagerWindow, state: &SharedState) {
     ui_callback!(on_add_executable, |ui, state| {
         if let Some(path) = pick_file("Game executable", &["exe"]) {
             if discovery::executable(&path) {
-                if !state.settings.executables.iter().any(|entry| same_executable(entry, &path)) { state.settings.executables.push(path.canonicalize().unwrap_or(path)); save(&ui, state); }
+                let path = path.canonicalize().unwrap_or(path);
+                if !state.settings.executables.iter().any(|entry| same_executable(entry, &path)) {
+                    state.settings.executables.push(path.clone());
+                    save(&ui, state);
+                }
+                state.select_after_scan = Some(path);
                 scan(&ui, state);
             } else { ui.set_stage("Choose an x86 or x64 Windows executable.".into()); }
         }
@@ -847,7 +879,7 @@ fn bind(ui: &ManagerWindow, state: &SharedState) {
         prepare_review(&ui, state);
     });
     ui_callback!(on_use_cached_runtime, |ui, state| {
-        if !ui.get_can_use_cached_runtime() { return; }
+        if !ui.get_can_use_cached_runtime() || ui.get_busy() { return; }
         if let Some(session) = state.session.as_mut() { session.runtime_only = true; }
         ui.set_catalog_failed(false);
         review(&ui, state);
@@ -882,6 +914,8 @@ fn bind(ui: &ManagerWindow, state: &SharedState) {
                         (_, Some(effect)) => session.selection.set_effect(package, effect, action == 1),
                         (_, None) => session.selection.set_all(package, action == 1),
                     }
+                } else if action == 2 && effect.is_none() {
+                    session.selection.shaders.remove(id);
                 }
             }
             render_catalog(&ui, state);
@@ -1020,7 +1054,7 @@ fn run() -> Result<()> {
         let summary = inspect(&game, &metadata);
         ViewGame { game, summary, artwork: None }
     }).collect();
-    let state = Rc::new(RefCell::new(State { data, settings, games, query: String::new(), filter: 0, session: None, events, artwork_generation: 0, checking_compatibility: false }));
+    let state = Rc::new(RefCell::new(State { data, settings, games, query: String::new(), filter: 0, session: None, events, artwork_generation: 0, checking_compatibility: false, select_after_scan: None }));
     let ui = ManagerWindow::new()?;
     ui.set_apis(rows(Api::ALL.iter().map(|api| api.label().into()).collect()));
     ui.set_categories(rows(CATEGORIES.iter().map(|label| (*label).into()).collect()));

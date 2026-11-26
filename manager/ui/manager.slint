@@ -58,6 +58,19 @@ component AccentButton inherits Rectangle {
     }
 }
 
+component TabButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    in property <bool> enabled: true;
+    callback clicked;
+    VerticalLayout {
+        padding-top: 8px;
+        spacing: 4px;
+        Button { text: root.text; enabled: root.enabled; clicked => { root.clicked(); } }
+        Rectangle { height: 2px; background: root.active ? Appearance.accent : transparent; }
+    }
+}
+
 component CheckStroke inherits Rectangle {
     width: 2px;
     height: 2px;
@@ -105,6 +118,7 @@ export component ManagerWindow inherits Window {
     in property <GameRow> game;
     in property <string> details;
     in property <string> summary;
+    in property <string> review-problem;
     in property <string> stage;
     in property <string> cache-info;
     in property <string> package-limit: "2048";
@@ -201,12 +215,12 @@ export component ManagerWindow inherits Window {
                     vertical-alignment: center;
                     horizontal-stretch: 1;
                 }
-                Button {
-                    text: "Library"; checked: root.page != 1 && root.page != 9;
+                TabButton {
+                    text: "Library"; active: root.page != 1 && root.page != 9;
                     enabled: !root.busy; clicked => { root.navigate(root.game.key != "" ? 2 : 0); }
                 }
-                Button {
-                    text: "Settings"; checked: root.page == 1 || root.page == 9;
+                TabButton {
+                    text: "Settings"; active: root.page == 1 || root.page == 9;
                     enabled: !root.busy; clicked => { root.navigate(1); }
                 }
             }
@@ -271,7 +285,7 @@ export component ManagerWindow inherits Window {
                                             enabled: !root.busy;
                                             clicked => { root.open-game(game.key); }
                                         }
-                                        Text { text: game.status; color: game.installed ? Appearance.installed : Appearance.muted; font-size: 12px; overflow: elide; }
+                                        Text { text: game.source + " · " + game.status; color: game.installed ? Appearance.installed : Appearance.muted; font-size: 12px; overflow: elide; }
                                     }
                                     StatusMark { installed: game.installed; }
                                 }
@@ -414,6 +428,7 @@ export component ManagerWindow inherits Window {
                                 padding: 8px;
                                 spacing: 8px;
                                 if row.kind != 0 : CheckBox {
+                                    accessible-label: row.title;
                                     checked: row.selected;
                                     enabled: !row.required && !root.busy;
                                     toggled => { root.catalog-action(row.key, self.checked ? 1 : 2); }
@@ -436,6 +451,7 @@ export component ManagerWindow inherits Window {
                 if root.page == 7 : VerticalLayout {
                     spacing: 12px;
                     Heading { text: root.operation == "Uninstall" ? "Review removal" : (root.operation == "Modify" ? "Review shader changes" : (root.operation == "Install" ? "Review installation" : root.operation + " review")); }
+                    if !root.busy && !root.catalog-failed && root.review-problem != "" : Subtle { text: root.review-problem; }
                     if root.busy || root.catalog-failed : Rectangle { vertical-stretch: 1; }
                     if !root.busy && !root.catalog-failed : ScrollView {
                         vertical-stretch: 1;
@@ -446,7 +462,7 @@ export component ManagerWindow inherits Window {
                         alignment: start;
                         if root.catalog-failed : AccentButton { text: "Retry loading"; enabled: !root.busy; clicked => { root.load-catalog(); } }
                         if root.catalog-failed && root.can-use-cached-runtime : Button { text: "Use cached runtime only"; clicked => { root.use-cached-runtime(); } }
-                        if !root.busy && !root.catalog-failed : AccentButton { text: root.operation == "Modify" ? "Apply changes" : root.operation; clicked => { root.execute(); } }
+                        if !root.busy && !root.catalog-failed : AccentButton { text: root.operation == "Modify" ? "Apply changes" : root.operation; enabled: root.review-problem == ""; clicked => { root.execute(); } }
                         if !root.busy && !root.catalog-failed && root.can-edit-content : Button { text: "Choose shaders"; clicked => { root.edit-content(5); } }
                         if !root.busy && !root.catalog-failed && root.can-edit-content && root.addon : Button { text: "Choose add-ons"; clicked => { root.edit-content(6); } }
                     }
