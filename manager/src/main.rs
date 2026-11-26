@@ -47,6 +47,7 @@ struct Session {
     had_selection: bool,
     manages_content: bool,
     runtime_only: bool,
+    official_handoff: bool,
 }
 
 struct State {
@@ -320,7 +321,7 @@ fn details(ui: &ManagerWindow, state: &mut State, key: &str) {
         key: key.to_owned(), target, status: entry.summary.clone(), operation: Operation::Install,
         api: renderer, installed_api: existing_api.or(receipt.api), addon: receipt.addon, acknowledged: false,
         shaders: vec![], addons: vec![], selection: receipt.selection, expanded: BTreeSet::new(),
-        query: String::new(), category: 0, had_selection: receipt.game.is_some(), manages_content: receipt.selection_managed, runtime_only: false,
+        query: String::new(), category: 0, had_selection: receipt.game.is_some(), manages_content: receipt.selection_managed, runtime_only: false, official_handoff: false,
     });
     render_games(ui, state);
 }
@@ -435,7 +436,7 @@ fn wants_content(session: &Session) -> bool {
 
 fn prepare_review(ui: &ManagerWindow, state: &State) {
     let Some(session) = &state.session else { return; };
-    if session.api == Some(Api::Vulkan) || session.status.vulkan {
+    if session.official_handoff || session.api == Some(Api::Vulkan) || session.status.vulkan {
         legacy_setup(ui, state);
     } else if session.api.is_none() {
         ui.set_page(4);
@@ -643,7 +644,7 @@ fn handle(ui: &ManagerWindow, state: &mut State, event: Event) {
             match result {
                 Ok(()) => {
                     details(ui, state, ui.get_game().key.as_str());
-                    ui.set_stage("Official setup closed. The game’s status has been checked.".into());
+                    ui.set_stage("Game status refreshed. Use Rescan if you finish setup in a separate administrator window.".into());
                 }
                 Err(error) => report(ui, state, Err(error)),
             }
@@ -678,6 +679,7 @@ fn begin(ui: &ManagerWindow, state: &mut State, operation: &str, addon: bool) {
     session.api = if session.status.vulkan { Some(Api::Vulkan) } else { session.installed_api.or(target.api) };
     if target.forced && session.operation == Operation::Install { session.api = target.api; }
     session.acknowledged = false;
+    session.official_handoff = false;
     ui.set_addon(session.addon && session.operation != Operation::Uninstall);
     ui.set_operation(operation.into());
     ui.set_renderer_handoff(session.api == Some(Api::Vulkan));
@@ -839,7 +841,15 @@ fn bind(ui: &ManagerWindow, state: &SharedState) {
             Err(error) => report(&ui, state, Err(error)),
         }
     });
-    ui_callback!(on_legacy, |ui, state| { legacy_setup(&ui, state); });
+    ui_callback!(on_legacy, |ui, state| {
+        let Some(session) = state.session.as_mut() else { return; };
+        session.official_handoff = true;
+        if session.addon && !session.acknowledged {
+            ui.set_page(3);
+        } else {
+            legacy_setup(&ui, state);
+        }
+    });
     ui_callback!(on_game_folder, |ui, state| {
         if let Some(session) = &state.session {
             if let Ok(target) = &session.target {

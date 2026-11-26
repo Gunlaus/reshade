@@ -49,6 +49,8 @@ component AccentButton inherits Rectangle {
     in property <string> text;
     in property <bool> enabled: true;
     callback clicked;
+    min-height: 36px;
+    max-height: 36px;
     border-radius: 6px;
     border-width: 1px;
     border-color: root.enabled ? Appearance.accent : Appearance.group;
@@ -98,6 +100,56 @@ component StatusMark inherits Rectangle {
         CheckStroke { x: 9px; y: 7px; background: root.check-color; }
         CheckStroke { x: 10px; y: 6px; background: root.check-color; }
         CheckStroke { x: 11px; y: 5px; background: root.check-color; }
+    }
+}
+
+component GameEntry inherits Rectangle {
+    in property <GameRow> game;
+    in property <bool> enabled: true;
+    callback open;
+    height: 56px;
+    border-radius: 4px;
+    border-width: root.game.selected || keyboard.has-focus ? 1px : 0px;
+    border-color: keyboard.has-focus ? Appearance.accent : Appearance.line;
+    background: root.game.selected || pointer.has-hover ? Appearance.group : Appearance.sidebar;
+    accessible-role: button;
+    accessible-label: root.game.title;
+    accessible-description: root.game.source + ". " + root.game.status;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.open(); } }
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 8px;
+        Rectangle {
+            width: 40px; height: 40px; border-radius: 4px;
+            background: Appearance.art-placeholder; clip: true;
+            Image { source: root.game.art; width: parent.width; height: parent.height; image-fit: cover; }
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 4px;
+            Text { text: root.game.title; color: Appearance.text; font-size: 14px; font-weight: 600; overflow: elide; }
+            Text { text: root.game.source + " · " + root.game.status; color: Appearance.muted; font-size: 12px; overflow: elide; }
+        }
+        StatusMark { installed: root.game.installed; }
+    }
+    keyboard := FocusScope {
+        width: 0px;
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n") {
+                root.open();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    pointer := TouchArea {
+        enabled: root.enabled;
+        clicked => { keyboard.focus(); root.open(); }
     }
 }
 
@@ -261,34 +313,10 @@ export component ManagerWindow inherits Window {
                         vertical-stretch: 1;
                         VerticalLayout {
                             spacing: 4px;
-                            for game in root.games : Rectangle {
-                                height: 52px;
-                                border-radius: 4px;
-                                border-width: game.selected ? 1px : 0px;
-                                border-color: Appearance.line;
-                                background: game.selected ? Appearance.group : Appearance.sidebar;
-                                HorizontalLayout {
-                                    padding-left: 8px;
-                                    padding-right: 8px;
-                                    spacing: 8px;
-                                    Rectangle {
-                                        width: 40px; height: 40px; border-radius: 4px;
-                                        background: Appearance.art-placeholder; clip: true;
-                                        Image { source: game.art; width: parent.width; height: parent.height; image-fit: cover; }
-                                    }
-                                    VerticalLayout {
-                                        horizontal-stretch: 1;
-                                        alignment: center;
-                                        Button {
-                                            text: game.title;
-                                            accessible-description: game.source + ". " + game.status;
-                                            enabled: !root.busy;
-                                            clicked => { root.open-game(game.key); }
-                                        }
-                                        Text { text: game.source + " · " + game.status; color: game.installed ? Appearance.installed : Appearance.muted; font-size: 12px; overflow: elide; }
-                                    }
-                                    StatusMark { installed: game.installed; }
-                                }
+                            for item in root.games : GameEntry {
+                                game: item;
+                                enabled: !root.busy;
+                                open => { root.open-game(item.key); }
                             }
                         }
                     }
@@ -332,16 +360,19 @@ export component ManagerWindow inherits Window {
                                 if root.game-facts != "" : Subtle { text: root.game-facts; }
                             }
                         }
-                        HorizontalLayout {
-                            spacing: 8px;
-                            alignment: start;
-                            if root.primary-action != "" : AccentButton {
-                                text: root.compatibility-action && root.checking-compatibility ? "Checking compatibility…" : root.primary-action;
-                                enabled: !root.busy && (!root.compatibility-action || (!root.scanning && !root.checking-compatibility));
-                                clicked => { root.primary(); }
+                        Rectangle {
+                            height: 36px;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                if root.primary-action != "" : AccentButton {
+                                    text: root.compatibility-action && root.checking-compatibility ? "Checking compatibility…" : root.primary-action;
+                                    enabled: !root.busy && (!root.compatibility-action || (!root.scanning && !root.checking-compatibility));
+                                    clicked => { root.primary(); }
+                                }
+                                if root.missing-game : AccentButton { text: "Add relocated executable"; enabled: !root.busy && !root.scanning; clicked => { root.add-executable(); } }
+                                if !root.missing-game || root.can-forget : Button { text: root.show-options ? "Hide options" : "More options"; enabled: !root.busy; clicked => { root.show-options = !root.show-options; } }
                             }
-                            if root.missing-game : AccentButton { text: "Add relocated executable"; enabled: !root.busy && !root.scanning; clicked => { root.add-executable(); } }
-                            if !root.missing-game || root.can-forget : Button { text: root.show-options ? "Hide options" : "More options"; enabled: !root.busy; clicked => { root.show-options = !root.show-options; } }
                         }
                         if root.details != "" : Subtle { text: root.details; }
                         if root.import-picker : VerticalLayout {
@@ -381,6 +412,7 @@ export component ManagerWindow inherits Window {
                                 if root.can-forget : Button { text: "Remove from library"; enabled: !root.busy && !root.scanning; clicked => { root.forget-game(); } }
                             }
                         }
+                        Rectangle { vertical-stretch: 1; }
                     }
                 }
 
@@ -416,6 +448,7 @@ export component ManagerWindow inherits Window {
                     if root.page == 5 : Button { text: root.classic ? "Visual catalog" : "Classic Panel"; clicked => { root.set-classic(!root.classic); } }
                 }
                 Subtle { text: root.selection-info; }
+                if root.catalog.length == 0 : Subtle { text: "No packages match this view"; }
                 ScrollView {
                     vertical-stretch: 1;
                     VerticalLayout {
@@ -450,7 +483,11 @@ export component ManagerWindow inherits Window {
 
                 if root.page == 7 : VerticalLayout {
                     spacing: 12px;
-                    Heading { text: root.operation == "Uninstall" ? "Review removal" : (root.operation == "Modify" ? "Review shader changes" : (root.operation == "Install" ? "Review installation" : root.operation + " review")); }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Heading { horizontal-stretch: 1; text: root.operation == "Uninstall" ? "Review removal" : (root.operation == "Modify" ? "Review shader changes" : (root.operation == "Install" ? "Review installation" : root.operation + " review")); }
+                        if !root.busy && !root.catalog-failed && root.can-edit-renderer : Button { text: "Change renderer"; clicked => { root.edit-renderer(); } }
+                    }
                     if !root.busy && !root.catalog-failed && root.review-problem != "" : Subtle { text: root.review-problem; }
                     if root.busy || root.catalog-failed : Rectangle { vertical-stretch: 1; }
                     if !root.busy && !root.catalog-failed : ScrollView {
@@ -465,10 +502,7 @@ export component ManagerWindow inherits Window {
                         if !root.busy && !root.catalog-failed : AccentButton { text: root.operation == "Modify" ? "Apply changes" : root.operation; enabled: root.review-problem == ""; clicked => { root.execute(); } }
                         if !root.busy && !root.catalog-failed && root.can-edit-content : Button { text: "Choose shaders"; clicked => { root.edit-content(5); } }
                         if !root.busy && !root.catalog-failed && root.can-edit-content && root.addon : Button { text: "Choose add-ons"; clicked => { root.edit-content(6); } }
-                    }
-                    if !root.busy && !root.catalog-failed && root.can-edit-renderer : HorizontalLayout {
-                        alignment: start;
-                        Button { text: "Change renderer"; clicked => { root.edit-renderer(); } }
+                        Button { text: "Back"; enabled: !root.busy; clicked => { root.step-back(); } }
                     }
                 }
                 if root.page == 8 : VerticalLayout {
@@ -489,7 +523,7 @@ export component ManagerWindow inherits Window {
                     }
                     Rectangle { vertical-stretch: 1; }
                 }
-                if root.page >= 3 && root.page <= 7 : HorizontalLayout {
+                if root.page >= 3 && root.page <= 6 : HorizontalLayout {
                     alignment: start;
                     Button { text: "Back"; enabled: !root.busy; clicked => { root.step-back(); } }
                 }
