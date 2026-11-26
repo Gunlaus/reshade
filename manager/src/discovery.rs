@@ -101,6 +101,11 @@ pub fn discover(locations: &Locations, settings: &Settings) -> Vec<Game> {
     for exe in settings.executables.iter().filter(|path| executable(path)) {
         record(title_for(exe), exe.clone(), Source::Manual, None, Vec::new());
     }
+    for exe in settings.executables.iter().filter(|path| !path.is_file()) {
+        let game = Game { title: title_for(exe), executable: exe.clone(), source: Source::Manual,
+            store_id: None, artwork_paths: Vec::new() };
+        result.entry(game.key()).or_insert(game);
+    }
     let mut games: Vec<_> = result.into_values().collect();
     games.sort_by_cached_key(|g| (g.title.to_lowercase(), g.key()));
     games

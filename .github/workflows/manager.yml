@@ -103,12 +103,12 @@ jobs:
           if-no-files-found: error
       - name: Capture native UI
         id: screenshots
-        timeout-minutes: 1
+        timeout-minutes: 2
         continue-on-error: true
         run: |
           $exe = Get-Item manager/target/release/reshade-manager.exe
           $env:RESHADE_MANAGER_DATA = Join-Path $env:RUNNER_TEMP 'manager-screenshots'
-          foreach ($fixture in @('--render-fixtures', '--render-fixtures --details')) {
+          foreach ($fixture in @('--render-fixtures', '--render-fixtures --details', '--render-fixtures --review', '--render-fixtures --recovery')) {
             $process = Start-Process $exe.FullName $fixture -PassThru -Wait
             if ($process.ExitCode) {
               $log = Join-Path $env:RESHADE_MANAGER_DATA 'manager.log'
@@ -116,7 +116,7 @@ jobs:
               throw "Slint screenshot command exited with code $($process.ExitCode)"
             }
           }
-          foreach ($name in @('game-library.png', 'game-details.png')) {
+          foreach ($name in @('game-library.png', 'game-details.png', 'install-review.png', 'install-recovery.png')) {
             if (!(Test-Path (Join-Path $env:RESHADE_MANAGER_DATA $name))) { throw "Screenshot was not produced: $name" }
           }
           "SCREENSHOT_DIR=$env:RESHADE_MANAGER_DATA" >> $env:GITHUB_ENV

@@ -2,6 +2,14 @@
 
 The portable manager shares the ReShade runtime and content catalogs with upstream. The original setup application stays in the solution as a fallback.
 
+## Use the manager
+
+Choose a game in the library to see its status and next action. **Set up ReShade** opens a review when the renderer is known. From the review you can change the renderer or choose packages. The full add-on edition, artwork controls, and less common maintenance actions are in **More options**.
+
+Scanning uses local game files first and refreshes compatibility information in the background. A missing manually added game stays in the library so you can reconnect its drive or add a relocated executable. Removing that entry only clears the manual library reference.
+
+A failed install keeps your review and selections available. If the shader catalog cannot load and a standard runtime is already cached, a new standard installation can explicitly use the runtime on its own.
+
 ## Using the manager
 
 Download the Windows manager artifact from this fork's **ReShade Manager Windows** Actions workflow. Run `reshade-manager.exe` and select an installed game. Review the executable and graphics API before choosing shaders or add-ons. Setup downloads the corresponding ReShade runtime from reshade.me and does not start the game.

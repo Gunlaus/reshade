@@ -46,6 +46,7 @@ struct Session {
     category: usize,
     had_selection: bool,
     manages_content: bool,
+    runtime_only: bool,
 }
 
 struct State {
@@ -57,12 +58,14 @@ struct State {
     session: Option<Session>,
     events: mpsc::Sender<Event>,
     artwork_generation: u64,
+    checking_compatibility: bool,
 }
 
 enum Event {
-    Scanned(Vec<(Game, install::Status)>, String),
+    Scanned(Vec<(Game, install::Status)>),
+    Compatibility(Result<()>),
     Artwork(u64, String, PathBuf),
-    Catalog(Vec<Package>, Vec<Package>, String),
+    Catalog(Result<(Vec<Package>, Vec<Package>, String)>),
     Stage(String),
     Finished(Result<()>),
     Cache(Result<()>),
@@ -75,7 +78,9 @@ type SharedState = Rc<RefCell<State>>;
 fn rows<T: 'static + Clone>(items: Vec<T>) -> ModelRc<T> { ModelRc::new(VecModel::from(items)) }
 
 fn status_text(status: &install::Status) -> String {
-    if status.conflict { return "Multiple installations".into(); }
+    if status.conflict { return "Wrapper conflict".into(); }
+    if status.missing_game { return "Game file missing".into(); }
+    if status.needs_repair { return "Repair needed".into(); }
     if status.wrapper.is_some() || status.vulkan {
         return status.version.as_ref().map_or_else(|| "Installed".into(), |version| format!("Installed · {version}"));
     }
@@ -88,15 +93,22 @@ fn game_row(entry: &ViewGame) -> GameRow {
         source: entry.game.source.label().into(), status: status_text(&entry.summary).into(),
         installed: entry.summary.wrapper.is_some() || entry.summary.vulkan,
         art: entry.artwork.clone().unwrap_or_default(),
+        selected: false,
     }
 }
 
 fn render_games(ui: &ManagerWindow, state: &State) {
+    let selected = ui.get_game().key;
+    ui.set_library_count(state.games.len() as i32);
     ui.set_games(rows(state.games.iter().filter(|entry| {
         let matches = entry.game.title.to_lowercase().contains(&state.query) || entry.game.source.label().to_lowercase().contains(&state.query);
         let installed = entry.summary.wrapper.is_some() || entry.summary.vulkan;
         matches && (state.filter == 0 || (state.filter == 1 && installed) || (state.filter == 2 && !installed))
-    }).map(game_row).collect()));
+    }).map(|entry| {
+        let mut row = game_row(entry);
+        row.selected = row.key == selected;
+        row
+    }).collect()));
 }
 
 fn cache(state: &State) -> Cache {
@@ -140,6 +152,9 @@ fn compatibility(data: &Path) -> storage::Ini {
 }
 
 fn inspect(game: &Game, metadata: &storage::Ini) -> install::Status {
+    if !game.executable.is_file() {
+        return install::Status { missing_game: true, ..install::Status::default() };
+    }
     let Some(root) = game.executable.parent() else { return install::Status::default(); };
     let key = game.executable.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
     let base = metadata.get(&key).and_then(|v| v.get("installtarget"))
@@ -147,25 +162,38 @@ fn inspect(game: &Game, metadata: &storage::Ini) -> install::Status {
     install::status(&game.executable, base.as_deref().unwrap_or(root))
 }
 
-fn scan(ui: &ManagerWindow, state: &State) {
-    if ui.get_busy() { return; }
-    ui.set_busy(true);
-    ui.set_stage("Scanning installed games…".into());
+fn scan(ui: &ManagerWindow, state: &mut State) {
+    if ui.get_busy() || ui.get_scanning() { return; }
+    ui.set_scanning(true);
     let events = state.events.clone();
     let settings = state.settings.clone();
     let data = state.data.clone();
+    let refresh_compatibility = !state.checking_compatibility;
+    if refresh_compatibility {
+        state.checking_compatibility = true;
+        ui.set_checking_compatibility(true);
+    }
     thread::spawn(move || {
-        let message = match catalog::client().and_then(|client| catalog::metadata(&client, &data.join("metadata"), "Compatibility.ini")) {
-            Ok(_) => String::new(),
-            Err(e) => format!(" · Compatibility catalog unavailable ({e})"),
-        };
         let metadata = compatibility(&data);
-        let games = discovery::discover(&discovery::system_locations(), &settings).into_iter().map(|game| {
-            let summary = inspect(&game, &metadata);
-            (game, summary)
-        }).collect();
-        let _ = events.send(Event::Scanned(games, message));
+        let games = discovery::discover(&discovery::system_locations(), &settings)
+            .into_iter().map(|game| {
+                let summary = inspect(&game, &metadata);
+                (game, summary)
+            }).collect();
+        let _ = events.send(Event::Scanned(games));
+        if refresh_compatibility {
+            let result = catalog::client().and_then(|client| {
+                catalog::metadata(&client, &data.join("metadata"), "Compatibility.ini").map(|_| ())
+            });
+            let _ = events.send(Event::Compatibility(result));
+        }
     });
+}
+
+fn same_executable(a: &Path, b: &Path) -> bool {
+    let a = a.canonicalize().unwrap_or_else(|_| a.to_owned());
+    let b = b.canonicalize().unwrap_or_else(|_| b.to_owned());
+    install::same_path(&a, &b)
 }
 
 fn artwork_jobs(state: &mut State, only: Option<(String, bool)>) {
@@ -200,42 +228,100 @@ fn receipt_for_entry(target: &Result<Target>) -> Option<install::Receipt> {
     receipt.game.is_some().then_some(receipt)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GameAction {
+    Install, Import, Repair, Update, Shaders, Legacy, CheckCompatibility, Unavailable,
+}
+
+fn next_action(target: Option<&Target>, status: &install::Status, receipt: &install::Receipt, compatible: bool) -> GameAction {
+    use GameAction::*;
+    let Some(target) = target else { return Unavailable; };
+    if target.banned || status.conflict || status.receipt_conflict { return Unavailable; }
+    if !compatible { return CheckCompatibility; }
+    if status.vulkan || (status.wrapper.is_none() && receipt.game.is_none() && target.api == Some(Api::Vulkan)) {
+        return Legacy;
+    }
+    if status.wrapper.is_none() {
+        return if receipt.game.is_some() { Repair } else { Install };
+    }
+    if receipt.game.is_none() { return Import; }
+    if status.version.as_deref().is_some_and(install::is_older_than_distribution) {
+        Update
+    } else {
+        Shaders
+    }
+}
+
 fn details(ui: &ManagerWindow, state: &mut State, key: &str) {
     let Some(entry) = state.games.iter_mut().find(|entry| entry.game.key() == key) else { return; };
     let target = pe::analyze(&entry.game.executable, &compatibility(&state.data));
-    let compat_available = state.data.join("metadata/Compatibility.ini").is_file();
-    let explanation = match &target {
-        Ok(target) => {
-            entry.summary = install::status(&target.executable, &target.base);
-            let mut text = format!("{}\nArchitecture · {}\nGraphics API · {}\n\n{}",
-                status_text(&entry.summary), target.arch.label(), target.api.map(Api::label).unwrap_or("Unknown"), target.executable.display());
-            if target.banned { text.push_str("\n\nUpstream flags this game as blocked for ReShade."); }
-            if !target.notes.is_empty() { text.push_str("\n\n"); text.push_str(&target.notes.join("\n")); }
-            if !compat_available { text.push_str("\nCompatibility data is unavailable. Rescan online before changing this installation."); }
-            if entry.summary.wrapper.is_none() && !entry.summary.vulkan && install::receipt(&target.base).is_ok_and(|receipt| receipt.game.is_some()) {
-                text.push_str("\nThe manager found an installation record but the runtime is missing. Use Repair to restore it.");
-            }
-            text
-        }
-        Err(error) => format!("Could not analyze this executable · {error:#}"),
-    };
-    let existing = entry.summary.wrapper.is_some() || entry.summary.vulkan || receipt_for_entry(&target).is_some();
-    let usable = target.as_ref().is_ok_and(|t| (!t.banned || existing) && compat_available);
+    let compatible = state.data.join("metadata/Compatibility.ini").is_file();
     let receipt = receipt_for_entry(&target).unwrap_or_default();
-    let api = target.as_ref().ok().and_then(|target| target.api);
+    let api = target.as_ref().ok().and_then(|t| t.api);
+    let mut guidance = String::new();
+    if let Ok(t) = &target {
+        entry.summary = install::status(&t.executable, &t.base);
+        if entry.summary.receipt_conflict {
+            guidance = "This folder is managed for a different executable. Select that game or open the game folder to check the installation.".into();
+        } else if entry.summary.conflict {
+            guidance = "More than one ReShade wrapper was found. Open the game folder to inspect them before making changes.".into();
+        } else if t.banned {
+            guidance = "The compatibility catalog marks this game as blocked for ReShade.".into();
+        } else if entry.summary.needs_repair {
+            guidance = "The ReShade runtime is missing. Repair can restore it using the recorded settings.".into();
+        }
+        if !t.notes.is_empty() {
+            if !guidance.is_empty() { guidance.push_str("\n"); }
+            guidance.push_str(&t.notes.join("\n"));
+        }
+    } else if !entry.game.executable.is_file() {
+        guidance = "The game executable may have moved or the drive may be disconnected. Reconnect the drive, or add the executable at its new location.".into();
+    } else if let Err(error) = &target {
+        guidance = format!("Could not read this executable. {error:#}");
+    }
+    let installed = entry.summary.wrapper.is_some() || entry.summary.vulkan || receipt.game.is_some();
+    let action = next_action(target.as_ref().ok(), &entry.summary, &receipt, compatible);
+    let (primary, message) = match action {
+        GameAction::Install => ("Set up ReShade", ""),
+        GameAction::Import => ("Import installation", "Confirm the edition once to manage this installation."),
+        GameAction::Repair => ("Repair installation", ""),
+        GameAction::Update => ("Review update", ""),
+        GameAction::Shaders => ("Manage shaders", ""),
+        GameAction::Legacy => ("Open official setup", "Vulkan setup uses the official ReShade installer."),
+        GameAction::CheckCompatibility => ("Check compatibility", "Connect to the internet to download compatibility information."),
+        GameAction::Unavailable => ("", ""),
+    };
+    if !message.is_empty() {
+        if !guidance.is_empty() { guidance.push_str("\n"); }
+        guidance.push_str(message);
+    }
+    let existing_api = entry.summary.wrapper.as_ref()
+        .and_then(|path| Api::ALL.into_iter().find(|api| path.file_stem().is_some_and(|name| name.eq_ignore_ascii_case(api.name()))));
+    let renderer = if entry.summary.vulkan { Some(Api::Vulkan) } else { existing_api.or(receipt.api).or(api) };
+    let facts = target.as_ref().ok().map(|t| format!("{}  ·  {}", renderer.map(Api::label).unwrap_or("Renderer unknown"), t.arch.label())).unwrap_or_default();
     ui.set_game(game_row(entry));
-    ui.set_details(explanation.into());
-    ui.set_installed(existing);
-    ui.set_usable(usable);
-    ui.set_can_import(existing && receipt.game.is_none() && !entry.summary.vulkan && !entry.summary.conflict);
+    ui.set_details(guidance.into());
+    ui.set_game_facts(facts.into());
+    ui.set_game_path(entry.game.executable.to_string_lossy().as_ref().into());
+    ui.set_primary_action(primary.into());
+    ui.set_can_addon(matches!(action, GameAction::Install | GameAction::Legacy) && !installed);
+    ui.set_can_maintain(installed && receipt.game.is_some() && !entry.summary.vulkan && !entry.summary.conflict && !entry.summary.receipt_conflict && compatible && target.as_ref().is_ok_and(|t| !t.banned));
+    ui.set_can_remove(installed && !entry.summary.vulkan && !entry.summary.conflict && !entry.summary.receipt_conflict && compatible && target.is_ok());
+    ui.set_compatibility_action(action == GameAction::CheckCompatibility);
+    ui.set_can_official(target.as_ref().is_ok_and(|t| !t.banned) && compatible && !entry.summary.receipt_conflict);
+    ui.set_can_forget(state.settings.executables.iter().any(|path| same_executable(path, &entry.game.executable)));
+    ui.set_missing_game(entry.summary.missing_game || !entry.game.executable.is_file());
+    ui.set_show_options(false);
+    ui.set_import_picker(false);
     ui.set_stage("".into());
     ui.set_page(2);
     state.session = Some(Session {
         key: key.to_owned(), target, status: entry.summary.clone(), operation: Operation::Install,
-        api, installed_api: receipt.api, addon: receipt.addon, acknowledged: false, shaders: vec![], addons: vec![],
-        selection: receipt.selection, expanded: BTreeSet::new(), query: String::new(), category: 0,
-        had_selection: receipt.game.is_some(), manages_content: receipt.selection_managed,
+        api: renderer, installed_api: existing_api.or(receipt.api), addon: receipt.addon, acknowledged: false,
+        shaders: vec![], addons: vec![], selection: receipt.selection, expanded: BTreeSet::new(),
+        query: String::new(), category: 0, had_selection: receipt.game.is_some(), manages_content: receipt.selection_managed, runtime_only: false,
     });
+    render_games(ui, state);
 }
 
 fn review(ui: &ManagerWindow, state: &State) {
@@ -266,6 +352,8 @@ fn review(ui: &ManagerWindow, state: &State) {
             display(&session.shaders, &|p| session.selection.shaders.contains_key(&p.id)),
             display(&session.addons, &|p| session.selection.addons.contains(&p.id))));
     }
+    ui.set_can_edit_renderer(session.operation == Operation::Install && !target.forced);
+    ui.set_can_edit_content(wants_content(session) && !session.runtime_only);
     ui.set_summary(summary.into());
     ui.set_stage("".into());
     ui.set_page(7);
@@ -321,54 +409,74 @@ fn render_catalog(ui: &ManagerWindow, state: &State) {
     ui.set_catalog(rows(result));
 }
 
+fn wants_content(session: &Session) -> bool {
+    matches!(session.operation, Operation::Install | Operation::Modify)
+        || (session.operation == Operation::Repair && session.manages_content)
+}
+
+fn prepare_review(ui: &ManagerWindow, state: &State) {
+    let Some(session) = &state.session else { return; };
+    if session.api == Some(Api::Vulkan) || session.status.vulkan {
+        legacy_setup(ui, state);
+    } else if session.api.is_none() {
+        ui.set_page(4);
+    } else if wants_content(session) && !session.runtime_only && session.shaders.is_empty() {
+        load_catalog(ui, state);
+    } else {
+        review(ui, state);
+    }
+}
+
 fn load_catalog(ui: &ManagerWindow, state: &State) {
     let Some(session) = &state.session else { return; };
     let Ok(target) = &session.target else { return; };
-    if session.api == Some(Api::Vulkan) || session.status.vulkan {
-        ui.set_stage("Use legacy setup for the shared Vulkan layer.".into());
-        return;
-    }
-    if matches!(session.operation, Operation::Update | Operation::Uninstall) || (session.operation == Operation::Repair && !session.manages_content) {
-        review(ui, state);
-        return;
-    }
-    if target.banned { ui.set_stage("Upstream flags this game as blocked for ReShade.".into()); return; }
-    if !session.shaders.is_empty() {
-        ui.set_page(5);
-        render_catalog(ui, state);
-        return;
-    }
     let arch = target.arch;
     let want_addons = session.addon;
     let location = state.data.join("metadata");
     let events = state.events.clone();
     ui.set_busy(true);
-    ui.set_stage("Loading the upstream shader and add-on catalogs…".into());
+    ui.set_catalog_failed(false);
+    ui.set_can_use_cached_runtime(false);
+    ui.set_page(7);
+    ui.set_stage("Loading shader packages…".into());
     thread::spawn(move || {
         let result = catalog::client().and_then(|client| {
             let effects = catalog::packages(catalog::metadata(&client, &location, "EffectPackages.ini")?, None);
+            if effects.is_empty() { bail!("The shader catalog is empty."); }
             let (addons, note) = if want_addons {
                 match catalog::metadata(&client, &location, "Addons.ini") {
                     Ok(ini) => (catalog::packages(ini, Some(arch)), String::new()),
-                    Err(e) => (vec![], format!("Add-on catalog unavailable · {e:#}")),
+                    Err(error) => (vec![], format!("Add-ons are unavailable. {error:#}")),
                 }
             } else { (vec![], String::new()) };
-            if effects.is_empty() { bail!("The upstream shader catalog is empty."); }
             Ok((effects, addons, note))
         });
-        let event = match result {
-            Ok((shaders, addons, note)) => Event::Catalog(shaders, addons, note),
-            Err(error) => Event::Catalog(vec![], vec![], format!("Shader catalog unavailable · {error:#}")),
-        };
-        let _ = events.send(event);
+        let _ = events.send(Event::Catalog(result));
     });
+}
+
+fn show_content(ui: &ManagerWindow, state: &mut State, page: i32) {
+    if let Some(session) = state.session.as_mut() {
+        session.query.clear();
+        session.category = 0;
+        ui.set_selected_category(0);
+        ui.set_page(page);
+        render_catalog(ui, state);
+    }
 }
 
 fn run_install(ui: &ManagerWindow, state: &State) {
     let Some(session) = &state.session else { return; };
     let Some(api) = session.api else { return; };
     let Ok(target) = &session.target else { return; };
-    let exe = target.executable.clone();
+    let Some(game) = state.games.iter().find(|entry| entry.game.key() == session.key) else {
+        ui.set_stage("This game is no longer in the library. Rescan and select it again.".into());
+        return;
+    };
+    let exe = game.game.executable.clone();
+    let expected_executable = target.executable.clone();
+    let expected_base = target.base.clone();
+    let expected_arch = target.arch;
     let (addon, acknowledged, operation) = (session.addon, session.acknowledged, session.operation);
     let shaders = session.shaders.clone();
     let addons = session.addons.clone();
@@ -382,9 +490,13 @@ fn run_install(ui: &ManagerWindow, state: &State) {
     ui.set_busy(true);
     ui.set_page(8);
     ui.set_progress_phase(0);
+    ui.set_result_failed(false);
     ui.set_stage("Preparing installation…".into());
     thread::spawn(move || {
         let result = pe::analyze(&exe, &compatibility(&data)).and_then(|target| {
+            if target.executable != expected_executable || target.base != expected_base || target.arch != expected_arch {
+                bail!("The installation target changed after review. Open the game again to check the new target.");
+            }
             install::execute(&cache, Plan { target: &target, api, addon, acknowledged, operation, selection: &selection,
                 shaders: &shaders, addons: &addons, shared: shared.as_deref(), backups: backups.as_deref() },
                 |phase| { let _ = events.send(Event::Stage(phase.to_owned())); })
@@ -398,14 +510,42 @@ fn run_install(ui: &ManagerWindow, state: &State) {
 
 fn handle(ui: &ManagerWindow, state: &mut State, event: Event) {
     match event {
-        Event::Scanned(games, note) => {
-            state.games = games.into_iter().map(|(game, summary)| ViewGame { game, summary, artwork: None }).collect();
+        Event::Scanned(games) => {
+            let mut previous: std::collections::BTreeMap<_, _> = state.games.drain(..)
+                .map(|entry| (entry.game.key(), entry.artwork)).collect();
+            state.games = games.into_iter().map(|(game, summary)| {
+                let artwork = previous.remove(&game.key()).flatten();
+                ViewGame { game, summary, artwork }
+            }).collect();
             let items = state.games.iter().map(|entry| &entry.game).collect::<Vec<_>>();
-            if let Err(error) = storage::write_json(&state.data.join("library.json"), &items) { diagnostics(&state.data, &format!("{error:#}")); }
-            ui.set_busy(false);
-            ui.set_stage(format!("{} games found{}", state.games.len(), note).into());
+            if let Err(error) = storage::write_json(&state.data.join("library.json"), &items) {
+                diagnostics(&state.data, &format!("{error:#}"));
+            }
+            ui.set_scanning(false);
+            let key = ui.get_game().key;
+            if ui.get_page() == 2 && !ui.get_busy() {
+                if state.games.iter().any(|entry| entry.game.key() == key.as_str()) {
+                    details(ui, state, key.as_str());
+                } else {
+                    ui.set_page(0);
+                    ui.set_game(GameRow::default());
+                    state.session = None;
+                }
+            }
             render_games(ui, state);
             artwork_jobs(state, None);
+        }
+        Event::Compatibility(result) => {
+            state.checking_compatibility = false;
+            ui.set_checking_compatibility(false);
+            if ui.get_busy() || ui.get_page() != 2 { return; }
+            if let Err(error) = &result { diagnostics(&state.data, &format!("{error:#}")); }
+            let key = ui.get_game().key;
+            if result.is_ok() {
+                details(ui, state, key.as_str());
+            } else if !state.data.join("metadata/Compatibility.ini").is_file() {
+                ui.set_stage("Could not check compatibility. Check your connection and try again.".into());
+            }
         }
         Event::Artwork(generation, key, path) if generation == state.artwork_generation => {
             if let Some(entry) = state.games.iter_mut().find(|entry| entry.game.key() == key) {
@@ -415,21 +555,31 @@ fn handle(ui: &ManagerWindow, state: &mut State, event: Event) {
             render_games(ui, state);
         }
         Event::Artwork(..) => {}
-        Event::Catalog(shaders, addons, note) => {
+        Event::Catalog(result) => {
             ui.set_busy(false);
-            ui.set_stage(note.into());
-            if shaders.is_empty() { return; }
-            if let Some(session) = state.session.as_mut() {
-                if !session.had_selection && session.operation != Operation::Modify { session.selection = Selection::defaults(&shaders); }
-                for package in shaders.iter().filter(|p| p.required) { session.selection.set_all(package, true); }
-                session.shaders = shaders;
-                session.addons = addons;
-                session.query.clear();
-                session.expanded.clear();
-                session.category = 0;
-                ui.set_selected_category(0);
-                ui.set_page(5);
-                render_catalog(ui, state);
+            match result {
+                Ok((shaders, addons, note)) => {
+                    if let Some(session) = state.session.as_mut() {
+                        if !session.had_selection && session.operation != Operation::Modify {
+                            session.selection = Selection::defaults(&shaders);
+                        }
+                        for package in shaders.iter().filter(|p| p.required) { session.selection.set_all(package, true); }
+                        session.shaders = shaders;
+                        session.addons = addons;
+                        session.expanded.clear();
+                        review(ui, state);
+                        ui.set_stage(note.into());
+                    }
+                }
+                Err(error) => {
+                    diagnostics(&state.data, &format!("{error:#}"));
+                    ui.set_catalog_failed(true);
+                    ui.set_can_use_cached_runtime(state.session.as_ref().is_some_and(|s|
+                        s.operation == Operation::Install && !s.addon && !s.had_selection
+                        && cache(state).contains(&install::runtime_url(false))
+                    ));
+                    ui.set_stage("Shader packages could not be loaded. Check your connection and retry.".into());
+                }
             }
         }
         Event::Stage(stage) => {
@@ -451,10 +601,12 @@ fn handle(ui: &ManagerWindow, state: &mut State, event: Event) {
                         }
                     }
                     ui.set_progress_phase(5);
-                    ui.set_stage("Changes completed and files verified.".into());
+                    ui.set_stage("Files verified. You can return to the game or open its folder.".into());
+                    render_games(ui, state);
                 }
                 Err(error) => {
                     diagnostics(&state.data, &format!("{error:#}"));
+                    ui.set_result_failed(true);
                     ui.set_stage(format!("{error:#}").into());
                 }
             }
@@ -462,7 +614,10 @@ fn handle(ui: &ManagerWindow, state: &mut State, event: Event) {
         Event::Legacy(result) => {
             ui.set_busy(false);
             match result {
-                Ok(()) => ui.set_stage("Legacy setup opened. Rescan after making changes there.".into()),
+                Ok(()) => {
+                    details(ui, state, ui.get_game().key.as_str());
+                    ui.set_stage("Official setup closed. The game’s status has been checked.".into());
+                }
                 Err(error) => report(ui, state, Err(error)),
             }
         }
@@ -476,6 +631,34 @@ fn handle(ui: &ManagerWindow, state: &mut State, event: Event) {
             render_settings(ui, state);
         }
     }
+}
+
+fn begin(ui: &ManagerWindow, state: &mut State, operation: &str, addon: bool) {
+    let Some(session) = state.session.as_mut() else { return; };
+    let Ok(target) = &session.target else { return; };
+    session.operation = match operation {
+        "Update" => Operation::Update, "Repair" => Operation::Repair, "Modify" => Operation::Modify,
+        "Uninstall" => Operation::Uninstall, _ => Operation::Install,
+    };
+    if session.operation != Operation::Uninstall && target.banned { return; }
+    if session.operation == Operation::Install {
+        session.addon = addon;
+        session.shaders.clear();
+        session.addons.clear();
+        session.selection = Selection::default();
+        session.runtime_only = false;
+    }
+    session.api = if session.status.vulkan { Some(Api::Vulkan) } else { session.installed_api.or(target.api) };
+    if target.forced && session.operation == Operation::Install { session.api = target.api; }
+    session.acknowledged = false;
+    ui.set_addon(session.addon && session.operation != Operation::Uninstall);
+    ui.set_operation(operation.into());
+    ui.set_renderer_handoff(session.api == Some(Api::Vulkan));
+    ui.set_selected_api(session.api.and_then(|api| Api::ALL.iter().position(|a| *a == api)).map(|i| i as i32).unwrap_or(-1));
+    ui.set_catalog_failed(false);
+    ui.set_stage("".into());
+    if session.addon && session.operation != Operation::Uninstall { ui.set_page(3); }
+    else { prepare_review(ui, state); }
 }
 
 fn bind(ui: &ManagerWindow, state: &SharedState) {
@@ -493,14 +676,46 @@ fn bind(ui: &ManagerWindow, state: &SharedState) {
         }};
     }
     ui_callback!(on_navigate, |ui, state, page| {
-        ui.set_page(page);
+        if page == 2 {
+            let key = ui.get_game().key;
+            if state.games.iter().any(|entry| entry.game.key() == key.as_str()) {
+                details(&ui, state, key.as_str());
+                return;
+            }
+            ui.set_game(GameRow::default());
+            state.session = None;
+            ui.set_page(0);
+        } else {
+            ui.set_page(page);
+        }
         ui.set_stage("".into());
         if page == 1 { render_settings(&ui, state); } else { render_games(&ui, state); }
     });
-    ui_callback!(on_search, |ui, state, query| { state.query = query.to_lowercase(); render_games(&ui, state); });
+    ui_callback!(on_search, |ui, state, query| { state.query = query.trim().to_lowercase(); ui.set_library_query(query); render_games(&ui, state); });
     ui_callback!(on_filter, |ui, state, filter| { state.filter = filter; ui.set_filter_index(filter); render_games(&ui, state); });
     ui_callback!(on_rescan, |ui, state| { scan(&ui, state); });
+    ui_callback!(on_clear_filters, |ui, state| {
+        state.query.clear();
+        state.filter = 0;
+        ui.set_library_query("".into());
+        ui.set_filter_index(0);
+        render_games(&ui, state);
+    });
     ui_callback!(on_open_game, |ui, state, key| { details(&ui, state, key.as_str()); });
+    ui_callback!(on_primary, |ui, state| {
+        let Some(session) = &state.session else { return; };
+        let receipt = receipt_for_entry(&session.target).unwrap_or_default();
+        match next_action(session.target.as_ref().ok(), &session.status, &receipt, state.data.join("metadata/Compatibility.ini").is_file()) {
+            GameAction::Install => begin(&ui, state, "Install", false),
+            GameAction::Repair => begin(&ui, state, "Repair", false),
+            GameAction::Update => begin(&ui, state, "Update", false),
+            GameAction::Shaders => begin(&ui, state, "Modify", false),
+            GameAction::Legacy => begin(&ui, state, "Install", false),
+            GameAction::Import => ui.set_import_picker(!ui.get_import_picker()),
+            GameAction::CheckCompatibility => scan(&ui, state),
+            GameAction::Unavailable => {}
+        }
+    });
     ui_callback!(on_add_location, |ui, state| {
         if let Some(path) = pick_folder() {
             if path.parent().is_none() {
@@ -518,7 +733,7 @@ fn bind(ui: &ManagerWindow, state: &SharedState) {
     ui_callback!(on_add_executable, |ui, state| {
         if let Some(path) = pick_file("Game executable", &["exe"]) {
             if discovery::executable(&path) {
-                if !state.settings.executables.contains(&path) { state.settings.executables.push(path); save(&ui, state); }
+                if !state.settings.executables.iter().any(|entry| same_executable(entry, &path)) { state.settings.executables.push(path.canonicalize().unwrap_or(path)); save(&ui, state); }
                 scan(&ui, state);
             } else { ui.set_stage("Choose an x86 or x64 Windows executable.".into()); }
         }
@@ -593,48 +808,58 @@ fn bind(ui: &ManagerWindow, state: &SharedState) {
         }
     });
     ui_callback!(on_legacy, |ui, state| { legacy_setup(&ui, state); });
+    ui_callback!(on_game_folder, |ui, state| {
+        if let Some(session) = &state.session {
+            if let Ok(target) = &session.target {
+                report(&ui, state, open_path(&target.base));
+            }
+        }
+    });
+    ui_callback!(on_forget_game, |ui, state| {
+        let key = ui.get_game().key;
+        if let Some(entry) = state.games.iter().find(|entry| entry.game.key() == key.as_str()) {
+            let path = entry.game.executable.clone();
+            state.settings.executables.retain(|entry| !same_executable(entry, &path));
+            ui.set_page(0);
+            ui.set_game(GameRow::default());
+            state.session = None;
+            save(&ui, state);
+            scan(&ui, state);
+        }
+    });
     ui_callback!(on_begin, |ui, state, operation, addon| {
-        let Some(session) = state.session.as_mut() else { return; };
-        let Ok(target) = &session.target else { return; };
-        session.operation = match operation.as_str() {
-            "Update" => Operation::Update, "Repair" => Operation::Repair, "Modify" => Operation::Modify,
-            "Uninstall" => Operation::Uninstall, _ => Operation::Install,
-        };
-        if session.operation != Operation::Uninstall && target.banned {
-            ui.set_stage("Upstream flags this game as blocked for ReShade.".into()); return;
-        }
-        if session.operation == Operation::Install {
-            session.addon = addon;
-        } else if !session.had_selection && matches!(session.operation, Operation::Update | Operation::Repair | Operation::Modify) {
-            ui.set_stage("Import the existing runtime and confirm its variant first.".into()); return;
-        }
-        session.api = if session.status.vulkan { Some(Api::Vulkan) } else {
-            session.status.wrapper.as_ref().and_then(|dll| Api::ALL.into_iter().find(|api| dll.file_stem().is_some_and(|name| name.eq_ignore_ascii_case(api.name()))))
-                .or(session.installed_api).or(target.api)
-        };
-        session.acknowledged = false;
-        ui.set_addon(session.addon && session.operation != Operation::Uninstall);
-        ui.set_operation(operation);
-        ui.set_selected_api(session.api.and_then(|api| Api::ALL.iter().position(|a| *a == api)).map(|i| i as i32).unwrap_or(-1));
-        ui.set_stage("".into());
-        ui.set_page(if session.addon && session.operation != Operation::Uninstall { 3 } else { 4 });
+        begin(&ui, state, operation.as_str(), addon);
     });
     ui_callback!(on_accept_warning, |ui, state| {
-        if let Some(session) = state.session.as_mut() { session.acknowledged = true; ui.set_page(4); }
+        if let Some(session) = state.session.as_mut() { session.acknowledged = true; }
+        prepare_review(&ui, state);
     });
-    ui_callback!(on_set_api, |ui, state, index| {
-        if let Some(session) = state.session.as_mut() {
-            let api = Api::ALL.get(index as usize).copied();
-            if session.target.as_ref().is_ok_and(|t| t.forced && t.api != api) {
-                ui.set_stage("The upstream compatibility catalog requires the recommended API.".into());
-                return;
+    ui_callback!(on_set_api, |ui, _state, index| {
+        ui.set_selected_api(index);
+        ui.set_renderer_handoff(Api::ALL.get(index as usize) == Some(&Api::Vulkan));
+    });
+    ui_callback!(on_load_catalog, |ui, state| {
+        if ui.get_page() == 4 {
+            if let Some(session) = state.session.as_mut() {
+                session.api = Api::ALL.get(ui.get_selected_api() as usize).copied();
             }
-            session.api = api;
-            ui.set_selected_api(index);
-            ui.set_stage("".into());
+        }
+        prepare_review(&ui, state);
+    });
+    ui_callback!(on_use_cached_runtime, |ui, state| {
+        if !ui.get_can_use_cached_runtime() { return; }
+        if let Some(session) = state.session.as_mut() { session.runtime_only = true; }
+        ui.set_catalog_failed(false);
+        review(&ui, state);
+    });
+    ui_callback!(on_edit_renderer, |ui, state| {
+        if let Some(session) = &state.session {
+            ui.set_selected_api(session.api.and_then(|api| Api::ALL.iter().position(|a| *a == api)).map(|i| i as i32).unwrap_or(-1));
+            ui.set_renderer_handoff(session.api == Some(Api::Vulkan));
+            ui.set_page(4);
         }
     });
-    ui_callback!(on_load_catalog, |ui, state| { load_catalog(&ui, state); });
+    ui_callback!(on_edit_content, |ui, state, page| { show_content(&ui, state, page); });
     ui_callback!(on_catalog_search, |ui, state, query| {
         if let Some(session) = state.session.as_mut() { session.query = query.to_lowercase(); render_catalog(&ui, state); }
     });
@@ -662,29 +887,14 @@ fn bind(ui: &ManagerWindow, state: &SharedState) {
             render_catalog(&ui, state);
         }
     });
-    ui_callback!(on_review, |ui, state| {
-        if ui.get_page() == 5 && ui.get_addon() {
-            if let Some(session) = state.session.as_mut() { session.query.clear(); }
-            ui.set_page(6); render_catalog(&ui, state);
-        } else { review(&ui, state); }
-    });
+    ui_callback!(on_review, |ui, state| { review(&ui, state); });
     ui_callback!(on_step_back, |ui, state| {
-        let Some(session) = state.session.as_mut() else { return; };
-        let next = match ui.get_page() {
-            3 => 2,
-            4 if session.addon && session.operation != Operation::Uninstall => 3,
-            4 => 2,
-            5 => 4,
-            6 => 5,
-            7 if matches!(session.operation, Operation::Update | Operation::Uninstall) || (session.operation == Operation::Repair && !session.manages_content) => 4,
-            7 if session.addon => 6,
-            7 => 5,
-            _ => 2,
-        };
-        session.query.clear();
-        ui.set_stage("".into());
-        ui.set_page(next);
-        render_catalog(&ui, state);
+        let page = ui.get_page();
+        if matches!(page, 5 | 6 | 8) || (page == 4 && state.session.as_ref().is_some_and(|s| !s.shaders.is_empty() && s.api.is_some())) {
+            review(&ui, state);
+        } else {
+            details(&ui, state, ui.get_game().key.as_str());
+        }
     });
     ui_callback!(on_execute, |ui, state| { run_install(&ui, state); });
 }
@@ -735,13 +945,13 @@ fn open_path(_: &Path) -> Result<()> { bail!("This action is available on Window
 fn manage_preset(target: &Target) -> Result<()> {
     let config = storage::safe_child(&target.base, Path::new("ReShade.ini"))?;
     let Some(source) = pick_file("ReShade preset", &["ini"]) else { return Ok(()); };
+    let text = fs::read_to_string(&config).context("The game has no readable ReShade configuration. Repair the installation before choosing a preset")?;
     let directory = storage::safe_child(&target.base, Path::new(".reshade-manager/presets"))?;
     let bytes = fs::read(&source)?;
     if bytes.len() > 8 * 1024 * 1024 { bail!("Preset exceeds size limit."); }
     let name = format!("{}.ini", storage::sha256(&bytes));
     let destination = storage::safe_child(&directory, Path::new(&name))?;
     storage::atomic_write(&destination, &bytes)?;
-    let text = fs::read_to_string(&config).context("Read the game’s ReShade configuration")?;
     let text = storage::set_ini(&text, "GENERAL", "PresetPath", &format!(r".\.reshade-manager\presets\{name}"));
     storage::atomic_write(&config, text.as_bytes())
 }
@@ -765,7 +975,7 @@ fn legacy_setup(ui: &ManagerWindow, state: &State) {
     let setup_folder = state.data.join("legacy-setup");
     let events = state.events.clone();
     ui.set_busy(true);
-    ui.set_stage("Verifying the official legacy installer…".into());
+    ui.set_stage("Opening official setup. Close it to return here.".into());
     thread::spawn(move || {
         let result = (|| -> Result<()> {
             let client = catalog::client()?;
@@ -775,7 +985,8 @@ fn legacy_setup(ui: &ManagerWindow, state: &State) {
             let mut command = std::process::Command::new(setup);
             command.arg(&executable);
             if vulkan { command.args(["--api", "vulkan"]); }
-            command.spawn().context("Open the verified ReShade installer")?;
+            let mut child = command.spawn().context("Open the verified ReShade installer")?;
+            child.wait().context("Wait for the official ReShade installer")?;
             Ok(())
         })();
         let _ = events.send(Event::Legacy(result));
@@ -809,7 +1020,7 @@ fn run() -> Result<()> {
         let summary = inspect(&game, &metadata);
         ViewGame { game, summary, artwork: None }
     }).collect();
-    let state = Rc::new(RefCell::new(State { data, settings, games, query: String::new(), filter: 0, session: None, events, artwork_generation: 0 }));
+    let state = Rc::new(RefCell::new(State { data, settings, games, query: String::new(), filter: 0, session: None, events, artwork_generation: 0, checking_compatibility: false }));
     let ui = ManagerWindow::new()?;
     ui.set_apis(rows(Api::ALL.iter().map(|api| api.label().into()).collect()));
     ui.set_categories(rows(CATEGORIES.iter().map(|label| (*label).into()).collect()));
@@ -830,7 +1041,7 @@ fn run() -> Result<()> {
         let sample = data.join("startup-ms.txt");
         slint::Timer::single_shot(Duration::ZERO, move || { let _ = fs::write(sample, start.elapsed().as_millis().to_string()); });
     } else if state.borrow().settings.scan_on_launch {
-        scan(&ui, &state.borrow());
+        scan(&ui, &mut state.borrow_mut());
     } else {
         artwork_jobs(&mut state.borrow_mut(), None);
     }
@@ -838,9 +1049,9 @@ fn run() -> Result<()> {
     let weak = ui.as_weak();
     let monitor = state.clone();
     automatic.start(slint::TimerMode::Repeated, Duration::from_secs(180), move || {
-        let Ok(model) = monitor.try_borrow() else { return; };
-        if let Some(ui) = weak.upgrade().filter(|ui| ui.get_page() == 0 && !ui.get_busy() && model.settings.scan_on_launch) {
-            scan(&ui, &model);
+        let Ok(mut model) = monitor.try_borrow_mut() else { return; };
+        if let Some(ui) = weak.upgrade().filter(|ui| ui.get_page() <= 2 && !ui.get_busy() && model.settings.scan_on_launch) {
+            scan(&ui, &mut model);
         }
     });
     ui.run()?;
@@ -849,24 +1060,43 @@ fn run() -> Result<()> {
 
 
 fn render_fixtures() -> Result<()> {
-    let details = std::env::args().any(|arg| arg == "--details");
+    let page = if std::env::args().any(|arg| arg == "--review") { 7 }
+        else if std::env::args().any(|arg| arg == "--recovery") { 8 }
+        else if std::env::args().any(|arg| arg == "--details") { 2 }
+        else { 0 };
     let ui = ManagerWindow::new()?;
     let directory = storage::data_directory()?;
     fs::create_dir_all(&directory)?;
-    let fixture_games = vec![
-        GameRow { key: "1".into(), title: "Direct3D 11 fixture".into(), source: "Steam".into(), status: "Installed · 6.8.0".into(), installed: true, art: Image::default() },
-        GameRow { key: "2".into(), title: "OpenGL fixture".into(), source: "Epic Games".into(), status: "Not installed".into(), installed: false, art: Image::default() },
-        GameRow { key: "3".into(), title: "Vulkan fixture".into(), source: "GOG Galaxy".into(), status: "Not installed".into(), installed: false, art: Image::default() },
+    let mut fixture_games = vec![
+        GameRow { key: "1".into(), title: "Direct3D 11 fixture".into(), source: "Steam".into(), status: "Installed · 6.8.0".into(), installed: true, art: Image::default(), selected: false },
+        GameRow { key: "2".into(), title: "OpenGL fixture".into(), source: "Epic Games".into(), status: "Not installed".into(), installed: false, art: Image::default(), selected: false },
+        GameRow { key: "3".into(), title: "Vulkan fixture".into(), source: "GOG Galaxy".into(), status: "Not installed".into(), installed: false, art: Image::default(), selected: false },
     ];
-    if details {
+    if page != 0 {
         ui.set_game(fixture_games[1].clone());
-        ui.set_details("Not installed\nArchitecture · x64\nGraphics API · OpenGL\n\nC:\\Games\\Fixture\\Fixture.exe".into());
-        ui.set_usable(true);
-        ui.set_page(2);
-    } else {
-        ui.set_games(rows(fixture_games));
+        ui.set_game_facts("OpenGL  ·  x64".into());
+        ui.set_game_path(r"C:\Games\Fixture\Fixture.exe".into());
+        ui.set_primary_action("Set up ReShade".into());
+        ui.set_can_addon(true);
+        fixture_games[1].selected = true;
+        ui.set_page(page);
+        ui.set_operation("Install".into());
+        ui.set_summary("OpenGL fixture\nOpenGL · x64\n\nStandard ReShade 6.8.0 · cached\n\nDestination\nC:\\Games\\Fixture\n\nShader packages\n  Standard effects · cached\n\nAdd-ons\n  None selected".into());
+        ui.set_can_edit_renderer(true);
+        ui.set_can_edit_content(true);
+        if page == 8 {
+            ui.set_result_failed(true);
+            ui.set_stage("The game folder is in use. Close the game and review the installation before retrying.".into());
+        }
     }
-    let name = if details { "game-details.png" } else { "game-library.png" };
+    ui.set_library_count(fixture_games.len() as i32);
+    ui.set_games(rows(fixture_games));
+    let name = match page {
+        2 => "game-details.png",
+        7 => "install-review.png",
+        8 => "install-recovery.png",
+        _ => "game-library.png",
+    };
     let path = directory.join(name);
     let weak = ui.as_weak();
     let capture_result = Rc::new(RefCell::new(None));
@@ -885,4 +1115,44 @@ fn render_fixtures() -> Result<()> {
     ui.run()?;
     let result = capture_result.borrow_mut().take();
     result.context("The window closed before the fixture was captured")?
+}
+
+#[cfg(test)]
+mod workflow_tests {
+    use super::*;
+    use reshade_manager::pe::Arch;
+
+    fn target(api: Option<Api>) -> Target {
+        Target {
+            executable: "game.exe".into(), base: ".".into(), arch: Arch::X64, api,
+            forced: false, banned: false, notes: vec![], compatibility: Default::default(),
+        }
+    }
+
+    #[test]
+    fn chooses_setup_compatibility_or_official_handoff_for_new_games() {
+        let status = install::Status::default();
+        let receipt = install::Receipt::default();
+        assert_eq!(next_action(Some(&target(None)), &status, &receipt, true), GameAction::Install);
+        assert_eq!(next_action(Some(&target(None)), &status, &receipt, false), GameAction::CheckCompatibility);
+        assert_eq!(next_action(Some(&target(Some(Api::Vulkan))), &status, &receipt, true), GameAction::Legacy);
+        assert_eq!(next_action(None, &status, &receipt, true), GameAction::Unavailable);
+    }
+
+    #[test]
+    fn routes_existing_installations_by_ownership_runtime_and_version() {
+        let target = target(Some(Api::Dxgi));
+        let mut status = install::Status { wrapper: Some("dxgi.dll".into()), ..Default::default() };
+        let mut receipt = install::Receipt::default();
+        assert_eq!(next_action(Some(&target), &status, &receipt, true), GameAction::Import);
+        receipt.game = Some(target.executable.clone());
+        status.version = Some("6.7.0.2045".into());
+        assert_eq!(next_action(Some(&target), &status, &receipt, true), GameAction::Update);
+        status.version = Some(install::RUNTIME_VERSION.into());
+        assert_eq!(next_action(Some(&target), &status, &receipt, true), GameAction::Shaders);
+        status.wrapper = None;
+        assert_eq!(next_action(Some(&target), &status, &receipt, true), GameAction::Repair);
+        status.receipt_conflict = true;
+        assert_eq!(next_action(Some(&target), &status, &receipt, true), GameAction::Unavailable);
+    }
 }

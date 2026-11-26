@@ -2,14 +2,15 @@ import { AboutSlint, Button, CheckBox, ComboBox, LineEdit, ScrollView } from "st
 
 export global Appearance {
     in property <bool> high-contrast;
-    out property <color> text: high-contrast ? #ffffff : #f3f0fc;
-    out property <color> muted: high-contrast ? #f1eef7 : #b4aec7;
-    out property <color> canvas: high-contrast ? #080808 : #11121c;
-    out property <color> sidebar: high-contrast ? #1f1d22 : #171725;
-    out property <color> panel: high-contrast ? #161419 : #191a2a;
-    out property <color> accent: high-contrast ? #d4bbff : #a891f7;
-    out property <color> art-placeholder: high-contrast ? #372853 : #2b2542;
-    out property <color> group: high-contrast ? #362c42 : #25223b;
+    out property <color> text: high-contrast ? #ffffff : #ededef;
+    out property <color> muted: high-contrast ? #f1eef7 : #adaeb8;
+    out property <color> canvas: high-contrast ? #080808 : #15161a;
+    out property <color> sidebar: high-contrast ? #1f1d22 : #1b1c22;
+    out property <color> panel: high-contrast ? #161419 : #222329;
+    out property <color> accent: high-contrast ? #d4bbff : #b29ae8;
+    out property <color> art-placeholder: high-contrast ? #372853 : #25262d;
+    out property <color> group: high-contrast ? #362c42 : #292a32;
+    out property <color> line: high-contrast ? #696974 : #37383f;
     out property <color> installed: high-contrast ? #9cffc6 : #84e3b1;
 }
 
@@ -20,6 +21,7 @@ export struct GameRow {
     status: string,
     installed: bool,
     art: image,
+    selected: bool,
 }
 
 export struct CatalogRow {
@@ -33,8 +35,8 @@ export struct CatalogRow {
 
 component Heading inherits Text {
     color: Appearance.text;
-    font-size: 32px;
-    font-weight: 700;
+    font-size: 28px;
+    font-weight: 600;
 }
 
 component Subtle inherits Text {
@@ -90,8 +92,8 @@ export component ManagerWindow inherits Window {
     title: "ReShade Manager";
     preferred-width: 1136px;
     preferred-height: 748px;
-    min-width: 805px;
-    min-height: 595px;
+    min-width: 864px;
+    min-height: 600px;
     background: Appearance.canvas;
     default-font-family: "Segoe UI";
 
@@ -109,9 +111,28 @@ export component ManagerWindow inherits Window {
     in property <string> artwork-limit: "128";
     in property <string> selection-info;
     in property <string> operation;
-    in property <bool> installed;
-    in property <bool> usable;
-    in property <bool> can-import;
+    in property <string> game-facts;
+    in property <string> game-path;
+    in property <string> primary-action;
+    in property <int> library-count;
+    in property <string> library-query;
+    in property <bool> scanning;
+    in property <bool> checking-compatibility;
+    in property <bool> compatibility-action;
+    in property <bool> renderer-handoff;
+    in property <bool> missing-game;
+    in property <bool> can-addon;
+    in property <bool> can-maintain;
+    in property <bool> can-remove;
+    in property <bool> can-official;
+    in property <bool> can-forget;
+    in-out property <bool> show-options;
+    in-out property <bool> import-picker;
+    in property <bool> result-failed;
+    in property <bool> catalog-failed;
+    in property <bool> can-use-cached-runtime;
+    in property <bool> can-edit-renderer;
+    in property <bool> can-edit-content;
     in property <bool> busy;
     in property <bool> addon;
     in property <bool> classic;
@@ -156,221 +177,223 @@ export component ManagerWindow inherits Window {
     callback import-existing(bool);
     callback presets();
     callback diagnostics();
+    callback primary();
+    callback clear-filters();
+    callback use-cached-runtime();
+    callback game-folder();
+    callback forget-game();
+    callback edit-renderer();
+    callback edit-content(int);
 
-    HorizontalLayout {
+    VerticalLayout {
         Rectangle {
-            width: 190px;
+            height: 56px;
             background: Appearance.sidebar;
-            VerticalLayout {
-                padding: 21px;
-                spacing: 12px;
-                HorizontalLayout {
-                    spacing: 9px;
-                    alignment: start;
-                    Rectangle { width: 8px; height: 24px; border-radius: 4px; background: Appearance.accent; }
-                    Text { text: "ReShade"; color: Appearance.text; font-size: 24px; font-weight: 750; }
+            HorizontalLayout {
+                padding-left: 24px;
+                padding-right: 24px;
+                spacing: 8px;
+                Text {
+                    text: "ReShade Manager";
+                    color: Appearance.text;
+                    font-size: 18px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
                 }
-                Subtle { text: "Game Manager"; }
-                Rectangle { height: 22px; }
-                Button { text: "Game library"; enabled: !root.busy; clicked => { root.navigate(0); } }
-                Button { text: "Settings"; enabled: !root.busy; clicked => { root.navigate(1); } }
-                Button { text: "About"; enabled: !root.busy; clicked => { root.navigate(9); } }
-                Rectangle { vertical-stretch: 1; }
-                Button { text: "Rescan games"; enabled: !root.busy; clicked => { root.rescan(); } }
+                Button {
+                    text: "Library"; checked: root.page != 1 && root.page != 9;
+                    enabled: !root.busy; clicked => { root.navigate(root.game.key != "" ? 2 : 0); }
+                }
+                Button {
+                    text: "Settings"; checked: root.page == 1 || root.page == 9;
+                    enabled: !root.busy; clicked => { root.navigate(1); }
+                }
             }
         }
-        VerticalLayout {
-            padding: 25px;
-            spacing: 12px;
-            if root.page == 0 : VerticalLayout {
-                spacing: 14px;
-                HorizontalLayout {
-                    Heading { text: "Game library"; horizontal-stretch: 1; }
-                    AccentButton { text: "Add executable"; enabled: !root.busy; clicked => { root.add-executable(); } }
-                }
-                HorizontalLayout {
-                    spacing: 10px;
-                    LineEdit { placeholder-text: "Search games"; edited(value) => { root.search(value); } }
-                    ComboBox { width: 155px; model: ["All games", "Installed", "Not installed"]; current-index: root.filter-index; selected => { root.filter(self.current-index); } }
-                }
-                if root.games.length == 0 : Rectangle {
-                    background: Appearance.panel;
-                    border-radius: 11px;
-                    vertical-stretch: 1;
-                    VerticalLayout {
-                        padding: 20px;
-                        alignment: center;
-                        spacing: 10px;
-                        Text { text: root.busy ? "Scanning your libraries" : "No games found"; color: Appearance.text; font-size: 22px; horizontal-alignment: center; }
-                        Subtle { text: "Try a different filter, rescan, or add a game executable."; horizontal-alignment: center; }
-                    }
-                }
-                if root.games.length > 0 : ScrollView {
-                    vertical-stretch: 1;
-                    VerticalLayout {
+        Rectangle { height: 1px; background: Appearance.line; }
+        if root.page != 1 && root.page != 9 : HorizontalLayout {
+            Rectangle {
+                width: 320px;
+                background: Appearance.sidebar;
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 12px;
+                    HorizontalLayout {
                         spacing: 8px;
-                        for game in root.games : Rectangle {
-                            height: 79px;
-                            background: Appearance.panel;
-                            border-radius: 10px;
-                            HorizontalLayout {
-                                padding: 10px;
-                                spacing: 16px;
-                                Rectangle {
-                                    width: 88px;
-                                    border-radius: 7px;
-                                    background: Appearance.art-placeholder;
-                                    clip: true;
-                                    Image { source: game.art; width: parent.width; height: parent.height; image-fit: cover; }
-                                }
-                                VerticalLayout {
-                                    alignment: center;
-                                    horizontal-stretch: 1;
-                                    spacing: 3px;
-                                    Text { text: game.title; color: Appearance.text; font-size: 17px; font-weight: 650; overflow: elide; }
-                                    Subtle { text: game.source; }
-                                }
+                        Text {
+                            text: "Games";
+                            color: Appearance.text;
+                            font-size: 20px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        Button { text: "Add game"; enabled: !root.busy && !root.scanning; clicked => { root.add-executable(); } }
+                    }
+                    LineEdit { text: root.library-query; placeholder-text: "Search games"; edited(value) => { root.search(value); } }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        ComboBox { model: ["All games", "ReShade installed", "ReShade absent"]; current-index: root.filter-index; selected => { root.filter(self.current-index); } }
+                        Button { text: root.scanning ? "Scanning…" : "Rescan"; enabled: !root.busy && !root.scanning; clicked => { root.rescan(); } }
+                    }
+                    if root.games.length == 0 : VerticalLayout {
+                        spacing: 8px;
+                        Subtle { text: root.scanning ? "Looking for games…" : (root.filter-index != 0 || root.library-query != "" ? "No games match these filters" : "No games in your library"); }
+                        if !root.scanning && (root.filter-index != 0 || root.library-query != "") : Button { text: "Clear filters"; clicked => { root.clear-filters(); } }
+                        if !root.scanning && root.library-count == 0 && root.filter-index == 0 && root.library-query == "" : Button { text: "Scan folders in Settings"; enabled: !root.busy; clicked => { root.navigate(1); } }
+                    }
+                    ScrollView {
+                        vertical-stretch: 1;
+                        VerticalLayout {
+                            spacing: 4px;
+                            for game in root.games : Rectangle {
+                                height: 52px;
+                                border-radius: 4px;
+                                border-width: game.selected ? 1px : 0px;
+                                border-color: Appearance.line;
+                                background: game.selected ? Appearance.group : Appearance.sidebar;
                                 HorizontalLayout {
-                                    width: 168px;
+                                    padding-left: 8px;
+                                    padding-right: 8px;
                                     spacing: 8px;
-                                    StatusMark { installed: game.installed; }
-                                    Text {
-                                        text: game.status;
-                                        color: game.installed ? Appearance.installed : Appearance.muted;
-                                        vertical-alignment: center;
-                                        overflow: elide;
+                                    Rectangle {
+                                        width: 40px; height: 40px; border-radius: 4px;
+                                        background: Appearance.art-placeholder; clip: true;
+                                        Image { source: game.art; width: parent.width; height: parent.height; image-fit: cover; }
                                     }
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        alignment: center;
+                                        Button {
+                                            text: game.title;
+                                            accessible-description: game.source + ". " + game.status;
+                                            enabled: !root.busy;
+                                            clicked => { root.open-game(game.key); }
+                                        }
+                                        Text { text: game.status; color: game.installed ? Appearance.installed : Appearance.muted; font-size: 12px; overflow: elide; }
+                                    }
+                                    StatusMark { installed: game.installed; }
                                 }
-                                Button { text: "Manage"; enabled: !root.busy; clicked => { root.open-game(game.key); } }
                             }
                         }
                     }
                 }
             }
+            Rectangle { width: 1px; background: Appearance.line; }
+            VerticalLayout {
+                padding: 24px;
+                spacing: 16px;
 
-            if root.page == 1 : VerticalLayout {
-                spacing: 10px;
-                Heading { text: "Settings"; }
-                ScrollView {
+                if root.page == 0 : VerticalLayout {
+                    spacing: 12px;
+                    Heading { text: "Your games"; }
+                    Subtle { text: root.library-count > 0 ? "Select a game to see its ReShade installation." : "Add a game’s executable or scan your installed games."; }
+                    if root.library-count == 0 : HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        AccentButton { text: "Add game"; enabled: !root.busy && !root.scanning; clicked => { root.add-executable(); } }
+                        Button { text: "Rescan"; enabled: !root.busy && !root.scanning; clicked => { root.rescan(); } }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                }
+
+                if root.page == 2 : ScrollView {
                     vertical-stretch: 1;
                     VerticalLayout {
-                        spacing: 10px;
-                        Subtle { text: "Game discovery"; }
+                        spacing: 16px;
+                        HorizontalLayout {
+                            spacing: 16px;
+                            Rectangle {
+                                width: 80px; height: 100px; background: Appearance.art-placeholder; border-radius: 4px; clip: true;
+                                Image { source: root.game.art; width: parent.width; height: parent.height; image-fit: cover; }
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                alignment: center;
+                                spacing: 4px;
+                                Heading { text: root.game.title; overflow: elide; }
+                                Subtle { text: root.game.source; }
+                                Text { text: root.game.status; color: root.game.installed ? Appearance.installed : Appearance.text; font-size: 14px; }
+                                if root.game-facts != "" : Subtle { text: root.game-facts; }
+                            }
+                        }
                         HorizontalLayout {
                             spacing: 8px;
-                            CheckBox { text: "Scan on launch"; checked: root.scan-on-launch; enabled: !root.busy; toggled => { root.scan-setting(self.checked); } }
-                            Button { text: "Add scan directory"; enabled: !root.busy; clicked => { root.add-location(); } }
+                            alignment: start;
+                            if root.primary-action != "" : AccentButton {
+                                text: root.compatibility-action && root.checking-compatibility ? "Checking compatibility…" : root.primary-action;
+                                enabled: !root.busy && (!root.compatibility-action || (!root.scanning && !root.checking-compatibility));
+                                clicked => { root.primary(); }
+                            }
+                            if root.missing-game : AccentButton { text: "Add relocated executable"; enabled: !root.busy && !root.scanning; clicked => { root.add-executable(); } }
+                            if !root.missing-game || root.can-forget : Button { text: root.show-options ? "Hide options" : "More options"; enabled: !root.busy; clicked => { root.show-options = !root.show-options; } }
                         }
-                        for dir[i] in root.directories : HorizontalLayout {
+                        if root.details != "" : Subtle { text: root.details; }
+                        if root.import-picker : VerticalLayout {
                             spacing: 8px;
-                            Subtle { text: dir; }
-                            Button { text: "Remove"; enabled: !root.busy; clicked => { root.remove-location(i); } }
+                            Subtle { text: "Choose the edition currently installed in this game."; }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                Button { text: "Standard"; enabled: !root.busy; clicked => { root.import-existing(false); } }
+                                Button { text: "Full add-on support"; enabled: !root.busy; clicked => { root.import-existing(true); } }
+                            }
                         }
-                        Subtle { text: "Installation"; }
-                        CheckBox { text: "Use Classic Panel for shaders"; checked: root.classic; enabled: !root.busy; toggled => { root.set-classic(self.checked); } }
-                        CheckBox { text: "Use shared shader storage"; checked: root.shared; enabled: !root.busy; toggled => { root.shared-setting(self.checked); } }
-                        CheckBox { text: "Keep installation backups"; checked: root.backups; enabled: !root.busy; toggled => { root.backup-setting(self.checked); } }
-                        Subtle { text: root.cache-info; }
-                        HorizontalLayout {
-                            spacing: 7px;
-                            Button { text: "Choose package cache folder"; enabled: !root.busy; clicked => { root.choose-cache(); } }
-                            Button { text: "Check for updates"; enabled: !root.busy; clicked => { root.check-updates(); } }
-                            Button { text: "Clear download cache"; enabled: !root.busy; clicked => { root.cache-action(0); } }
-                            Button { text: "Clear artwork cache"; enabled: !root.busy; clicked => { root.cache-action(1); } }
-                        }
-                        HorizontalLayout {
-                            spacing: 7px;
-                            package := LineEdit { text: root.package-limit; placeholder-text: "Package limit MB"; }
-                            artwork := LineEdit { text: root.artwork-limit; placeholder-text: "Artwork limit MB"; }
-                            Button { text: "Save limits (MB)"; enabled: !root.busy; clicked => { root.set-limits(package.text, artwork.text); } }
-                        }
-                        CheckBox { text: "High contrast"; checked: Appearance.high-contrast; enabled: !root.busy; toggled => { root.contrast-setting(self.checked); } }
-                        Button { text: "Open diagnostics"; clicked => { root.diagnostics(); } }
-                    }
-                }
-            }
-
-            if root.page == 2 : VerticalLayout {
-                spacing: 12px;
-                Heading { text: root.game.title; overflow: elide; }
-                Subtle { text: root.game.source; }
-                HorizontalLayout {
-                    spacing: 18px;
-                    Rectangle {
-                        width: 195px;
-                        height: 250px;
-                        background: Appearance.art-placeholder;
-                        border-radius: 12px;
-                        clip: true;
-                        Image { source: root.game.art; width: parent.width; height: parent.height; image-fit: cover; }
-                    }
-                    VerticalLayout {
-                        spacing: 8px;
-                        Subtle { text: root.details; vertical-stretch: 1; }
-                        HorizontalLayout {
-                            spacing: 7px;
-                            Button { text: "Choose artwork"; enabled: !root.busy; clicked => { root.artwork-action(false); } }
-                            Button { text: "Refresh artwork"; enabled: !root.busy; clicked => { root.artwork-action(true); } }
+                        if root.show-options : VerticalLayout {
+                            spacing: 8px;
+                            Rectangle { height: 1px; background: Appearance.line; }
+                            if root.game-path != "" : Subtle { text: root.game-path; }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                if root.can-addon : Button { text: "Set up with add-ons"; enabled: !root.busy; clicked => { root.begin("Install", true); } }
+                                if !root.missing-game : Button { text: "Open game folder"; enabled: !root.busy; clicked => { root.game-folder(); } }
+                                if root.can-official && root.primary-action != "Open official setup" : Button { text: "Official setup"; enabled: !root.busy; clicked => { root.legacy(); } }
+                            }
+                            if root.can-maintain || root.can-remove : HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                if root.can-maintain && root.primary-action != "Repair installation" : Button { text: "Repair"; enabled: !root.busy; clicked => { root.begin("Repair", false); } }
+                                if root.can-maintain && root.primary-action != "Manage shaders" && root.game.installed : Button { text: "Manage shaders"; enabled: !root.busy; clicked => { root.begin("Modify", false); } }
+                                if root.game.installed : Button { text: "Choose preset"; enabled: !root.busy; clicked => { root.presets(); } }
+                                if root.can-remove : Button { text: "Uninstall…"; enabled: !root.busy; clicked => { root.begin("Uninstall", false); } }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                if !root.missing-game : Button { text: "Choose artwork"; enabled: !root.busy; clicked => { root.artwork-action(false); } }
+                                if !root.missing-game : Button { text: "Refresh artwork"; enabled: !root.busy; clicked => { root.artwork-action(true); } }
+                                if root.can-forget : Button { text: "Remove from library"; enabled: !root.busy && !root.scanning; clicked => { root.forget-game(); } }
+                            }
                         }
                     }
                 }
-                if !root.installed : VerticalLayout {
-                    spacing: 8px;
-                    HorizontalLayout {
-                        spacing: 8px;
-                        AccentButton { text: "Install ReShade"; enabled: root.usable && !root.busy; clicked => { root.begin("Install", false); } }
-                        Button { text: "Install ReShade with Add-on Support"; enabled: root.usable && !root.busy; clicked => { root.begin("Install", true); } }
-                    }
-                    Subtle { text: "Choose the standard runtime for shader effects, or the full runtime to use optional ReShade add-ons."; }
-                }
-                if root.installed : VerticalLayout {
-                    spacing: 8px;
-                    HorizontalLayout {
-                        spacing: 6px;
-                        AccentButton { text: "Update"; enabled: root.usable && !root.busy; clicked => { root.begin("Update", false); } }
-                        Button { text: "Repair"; enabled: root.usable && !root.busy; clicked => { root.begin("Repair", false); } }
-                        Button { text: "Modify shaders"; enabled: root.usable && !root.busy; clicked => { root.begin("Modify", false); } }
-                        Button { text: "Presets"; enabled: !root.busy; clicked => { root.presets(); } }
-                        Button { text: "Uninstall"; enabled: root.usable && !root.busy; clicked => { root.begin("Uninstall", false); } }
-                    }
-                }
-                if root.can-import : VerticalLayout {
-                    spacing: 6px;
-                    Subtle { text: "Choose the installed runtime variant to import it. Import leaves the game’s files and presets in place."; }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        Button { text: "Import standard runtime"; enabled: !root.busy; clicked => { root.import-existing(false); } }
-                        Button { text: "Import full add-on runtime"; enabled: !root.busy; clicked => { root.import-existing(true); } }
-                    }
-                }
-                Button { text: "Open legacy setup"; enabled: !root.busy; clicked => { root.legacy(); } }
-                Rectangle { vertical-stretch: 1; }
-            }
 
             if root.page == 3 : VerticalLayout {
-                spacing: 14px;
-                Heading { text: "Full add-on support"; }
+                spacing: 16px;
+                Heading { text: "Use the full add-on edition"; }
                 Subtle { text: "Some online games prohibit ReShade add-ons or modified graphics injection. Anti-cheat may flag an installation, which can lead to account restrictions or bans. Check the individual game’s policies for compatibility and permission. These policies can also affect standard ReShade."; }
                 CheckBox { checked: false; text: "I understand the risks and have checked the game’s rules."; toggled => { warning-next.enabled = self.checked; } }
-                warning-next := AccentButton { text: "Continue"; enabled: false; clicked => { root.accept-warning(); } }
+                HorizontalLayout { alignment: start; warning-next := AccentButton { text: "Continue with add-ons"; enabled: false; clicked => { root.accept-warning(); } } }
                 Rectangle { vertical-stretch: 1; }
             }
 
             if root.page == 4 : VerticalLayout {
-                spacing: 14px;
-                Heading { text: "Graphics API"; }
-                Subtle { text: root.details; }
+                spacing: 16px;
+                Heading { text: "Choose the game renderer"; }
+                Subtle { text: "Choose the graphics API the game actually uses."; }
                 ComboBox { model: root.apis; current-index: root.selected-api; selected => { root.set-api(self.current-index); } }
                 HorizontalLayout {
                     spacing: 8px;
-                    AccentButton { text: "Continue"; enabled: root.selected-api >= 0 && !root.busy; clicked => { root.load-catalog(); } }
-                    Button { text: "Open legacy setup"; enabled: !root.busy; clicked => { root.legacy(); } }
+                    alignment: start;
+                    AccentButton { text: root.renderer-handoff ? "Open official setup" : "Continue to review"; enabled: root.selected-api >= 0 && !root.busy; clicked => { root.load-catalog(); } }
                 }
                 Rectangle { vertical-stretch: 1; }
             }
 
             if root.page == 5 || root.page == 6 : VerticalLayout {
-                spacing: 10px;
+                spacing: 12px;
                 Heading { text: root.page == 5 ? "Shader catalog" : "Add-on catalog"; }
                 HorizontalLayout {
                     spacing: 8px;
@@ -382,13 +405,13 @@ export component ManagerWindow inherits Window {
                 ScrollView {
                     vertical-stretch: 1;
                     VerticalLayout {
-                        spacing: 5px;
+                        spacing: 4px;
                         for row in root.catalog : Rectangle {
-                            min-height: 62px;
+                            min-height: 56px;
                             border-radius: 8px;
                             background: row.kind == 0 ? Appearance.group : Appearance.panel;
                             HorizontalLayout {
-                                padding: 9px;
+                                padding: 8px;
                                 spacing: 8px;
                                 if row.kind != 0 : CheckBox {
                                     checked: row.selected;
@@ -397,7 +420,7 @@ export component ManagerWindow inherits Window {
                                 }
                                 VerticalLayout {
                                     spacing: 2px;
-                                    Text { text: row.title; color: Appearance.text; font-size: 15px; font-weight: 650; overflow: elide; }
+                                    Text { text: row.title; color: Appearance.text; font-size: 16px; font-weight: 600; overflow: elide; }
                                     Subtle { text: row.subtitle; }
                                 }
                                 if row.kind == 0 : Button { text: row.selected ? "Collapse" : "Expand"; clicked => { root.catalog-action(row.key, 0); } }
@@ -407,40 +430,109 @@ export component ManagerWindow inherits Window {
                         }
                     }
                 }
-                AccentButton { text: root.page == 5 && root.addon ? "Choose add-ons" : "Review installation"; enabled: !root.busy; clicked => { root.review(); } }
+                HorizontalLayout { alignment: start; AccentButton { text: "Done"; enabled: !root.busy; clicked => { root.review(); } } }
             }
 
-            if root.page == 7 : VerticalLayout {
-                spacing: 12px;
-                Heading { text: root.operation + " review"; }
-                ScrollView {
-                    vertical-stretch: 1;
-                    VerticalLayout { padding: 8px; Subtle { text: root.summary; } }
-                }
-                AccentButton { text: root.operation; enabled: !root.busy; clicked => { root.execute(); } }
-            }
-            if root.page == 8 : VerticalLayout {
-                spacing: 14px;
-                Heading { text: root.busy ? "Working on " + root.game.title : "Installation result"; }
-                Subtle { text: root.stage; }
-                Rectangle {
-                    height: 8px;
-                    border-radius: 4px;
-                    background: Appearance.group;
-                    Rectangle {
-                        width: parent.width * min(root.progress-phase, 5) / 5;
-                        height: parent.height;
-                        border-radius: 4px;
-                        background: Appearance.accent;
-                        animate width { duration: 180ms; }
+                if root.page == 7 : VerticalLayout {
+                    spacing: 12px;
+                    Heading { text: root.operation == "Uninstall" ? "Review removal" : (root.operation == "Modify" ? "Review shader changes" : (root.operation == "Install" ? "Review installation" : root.operation + " review")); }
+                    if root.busy || root.catalog-failed : Rectangle { vertical-stretch: 1; }
+                    if !root.busy && !root.catalog-failed : ScrollView {
+                        vertical-stretch: 1;
+                        VerticalLayout { Subtle { text: root.summary; } }
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        if root.catalog-failed : AccentButton { text: "Retry loading"; enabled: !root.busy; clicked => { root.load-catalog(); } }
+                        if root.catalog-failed && root.can-use-cached-runtime : Button { text: "Use cached runtime only"; clicked => { root.use-cached-runtime(); } }
+                        if !root.busy && !root.catalog-failed : AccentButton { text: root.operation == "Modify" ? "Apply changes" : root.operation; clicked => { root.execute(); } }
+                        if !root.busy && !root.catalog-failed && root.can-edit-content : Button { text: "Choose shaders"; clicked => { root.edit-content(5); } }
+                        if !root.busy && !root.catalog-failed && root.can-edit-content && root.addon : Button { text: "Choose add-ons"; clicked => { root.edit-content(6); } }
+                    }
+                    if !root.busy && !root.catalog-failed && root.can-edit-renderer : HorizontalLayout {
+                        alignment: start;
+                        Button { text: "Change renderer"; clicked => { root.edit-renderer(); } }
                     }
                 }
-                Button { text: "Back to game details"; enabled: !root.busy; clicked => { root.open-game(root.game.key); } }
-                Rectangle { vertical-stretch: 1; }
+                if root.page == 8 : VerticalLayout {
+                    spacing: 12px;
+                    Heading { text: root.busy ? root.operation : (root.result-failed ? "Changes could not be completed" : "Changes complete"); }
+                    if root.stage != "" : Subtle { text: root.stage; }
+                    if root.busy : Rectangle {
+                        height: 4px;
+                        background: Appearance.group;
+                        Rectangle { width: parent.width * min(root.progress-phase, 5) / 5; height: parent.height; background: Appearance.accent; }
+                    }
+                    if !root.busy : HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        if root.result-failed : AccentButton { text: "Back to review"; clicked => { root.step-back(); } }
+                        Button { text: "Game details"; clicked => { root.open-game(root.game.key); } }
+                        Button { text: "Open game folder"; clicked => { root.game-folder(); } }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                }
+                if root.page >= 3 && root.page <= 7 : HorizontalLayout {
+                    alignment: start;
+                    Button { text: "Back"; enabled: !root.busy; clicked => { root.step-back(); } }
+                }
+                if root.page != 8 && root.stage != "" : Subtle { text: root.stage; }
+            }
+        }
+        if root.page == 1 || root.page == 9 : VerticalLayout {
+            padding: 24px;
+            spacing: 12px;
+            if root.page == 1 : VerticalLayout {
+                spacing: 12px;
+                Heading { text: "Settings"; }
+                ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        spacing: 12px;
+                        Subtle { text: "Game discovery"; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            CheckBox { text: "Scan on launch"; checked: root.scan-on-launch; enabled: !root.busy; toggled => { root.scan-setting(self.checked); } }
+                            Button { text: "Add scan directory"; enabled: !root.busy && !root.scanning; clicked => { root.add-location(); } }
+                        }
+                        for dir[i] in root.directories : HorizontalLayout {
+                            spacing: 8px;
+                            Subtle { text: dir; }
+                            Button { text: "Remove"; enabled: !root.busy && !root.scanning; clicked => { root.remove-location(i); } }
+                        }
+                        Subtle { text: "Installation"; }
+                        CheckBox { text: "Use Classic Panel for shaders"; checked: root.classic; enabled: !root.busy; toggled => { root.set-classic(self.checked); } }
+                        CheckBox { text: "Use shared shader storage"; checked: root.shared; enabled: !root.busy; toggled => { root.shared-setting(self.checked); } }
+                        CheckBox { text: "Keep installation backups"; checked: root.backups; enabled: !root.busy; toggled => { root.backup-setting(self.checked); } }
+                        Subtle { text: root.cache-info; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button { text: "Choose package cache folder"; enabled: !root.busy; clicked => { root.choose-cache(); } }
+                            Button { text: "Check for updates"; enabled: !root.busy; clicked => { root.check-updates(); } }
+                            Button { text: "Clear download cache"; enabled: !root.busy; clicked => { root.cache-action(0); } }
+                            Button { text: "Clear artwork cache"; enabled: !root.busy; clicked => { root.cache-action(1); } }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            package := LineEdit { text: root.package-limit; placeholder-text: "Package limit MB"; }
+                            artwork := LineEdit { text: root.artwork-limit; placeholder-text: "Artwork limit MB"; }
+                            Button { text: "Save limits (MB)"; enabled: !root.busy; clicked => { root.set-limits(package.text, artwork.text); } }
+                        }
+                        Subtle { text: "Appearance"; }
+                        CheckBox { text: "High contrast"; checked: Appearance.high-contrast; enabled: !root.busy; toggled => { root.contrast-setting(self.checked); } }
+                        HorizontalLayout {
+                            alignment: start;
+                            spacing: 8px;
+                            Button { text: "Open diagnostics"; clicked => { root.diagnostics(); } }
+                            Button { text: "About"; clicked => { root.navigate(9); } }
+                        }
+                    }
+                }
             }
 
             if root.page == 9 : VerticalLayout {
-                spacing: 15px;
+                spacing: 16px;
                 Heading { text: "About ReShade Manager"; }
                 Subtle { text: "Native Windows game library and setup for ReShade."; }
                 HorizontalLayout {
@@ -450,19 +542,7 @@ export component ManagerWindow inherits Window {
                 Rectangle { vertical-stretch: 1; }
             }
 
-            if root.page >= 3 && root.page <= 7 : HorizontalLayout {
-                alignment: start;
-                Button { text: "Back"; enabled: !root.busy; clicked => { root.step-back(); } }
-            }
-
-            if root.page != 8 : Text {
-                min-height: 24px;
-                text: root.stage;
-                color: Appearance.muted;
-                font-size: 13px;
-                overflow: elide;
-                vertical-alignment: center;
-            }
+            if root.stage != "" : Subtle { text: root.stage; }
         }
     }
 }

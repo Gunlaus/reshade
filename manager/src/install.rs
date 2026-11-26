@@ -35,6 +35,9 @@ pub struct Status {
     pub conflict: bool,
     pub configuration: bool,
     pub vulkan: bool,
+    pub missing_game: bool,
+    pub needs_repair: bool,
+    pub receipt_conflict: bool,
 }
 
 pub fn status(executable: &Path, base: &Path) -> Status {
@@ -59,10 +62,20 @@ pub fn status(executable: &Path, base: &Path) -> Status {
             status.version = pe::version_string(&global.join(format!("ReShade{number}.dll")), "ProductVersion").or(status.version);
         }
     }
+    match receipt(base) {
+        Ok(record) => {
+            if let Some(game) = record.game {
+                status.receipt_conflict = !same_path(&game, executable);
+                status.needs_repair = !status.receipt_conflict && status.wrapper.is_none() && !status.vulkan;
+            }
+        }
+        Err(_) => status.receipt_conflict = true,
+    }
+    status.conflict |= status.vulkan && status.wrapper.is_some();
     status
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
+pub fn same_path(a: &Path, b: &Path) -> bool {
     let a = a.to_string_lossy();
     let b = b.to_string_lossy();
     a.trim_start_matches(r"\\?\").eq_ignore_ascii_case(b.trim_start_matches(r"\\?\"))
@@ -133,7 +146,7 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
     if plan.addon && !plan.acknowledged && plan.operation != Operation::Uninstall {
         bail!("Acknowledge the add-on support warning before continuing.");
     }
-    if target.forced && target.api != Some(plan.api) { bail!("This executable requires its upstream compatibility API."); }
+    if plan.operation != Operation::Uninstall && target.forced && target.api != Some(plan.api) { bail!("This executable requires its upstream compatibility API."); }
     let module = PathBuf::from(wrapper_name(plan.api)?);
     if !base.is_dir() { bail!("The destination directory does not exist."); }
     let root = target.executable.parent().context("The executable has no parent directory")?;
@@ -150,7 +163,7 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
     }
     if existing.conflict || existing.vulkan { bail!("Multiple runtime wrappers or a shared Vulkan layer are present. Resolve the existing installation in legacy setup."); }
     let destination = safe_child(base, &module)?;
-    if destination.exists() && pe::version_string(&destination, "ProductName").as_deref() != Some("ReShade") {
+    if plan.operation != Operation::Uninstall && destination.exists() && pe::version_string(&destination, "ProductName").as_deref() != Some("ReShade") {
         bail!("{} is occupied by another graphics wrapper. Move it manually before installing.", destination.display());
     }
     if plan.operation == Operation::Uninstall {
@@ -295,14 +308,17 @@ pub fn execute(cache: &Cache, plan: Plan<'_>, mut progress: impl FnMut(&str)) ->
     Ok(())
 }
 
+fn distribution_version(input: &str) -> Option<[u32; 3]> {
+    let mut parts = input.trim_start_matches('v').split('.');
+    Some([parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?])
+}
+
+pub fn is_older_than_distribution(installed: &str) -> bool {
+    matches!((distribution_version(installed), distribution_version(RUNTIME_VERSION)), (Some(a), Some(b)) if a < b)
+}
+
 fn is_newer_than_distribution(installed: &str) -> bool {
-    fn version(input: &str) -> Vec<u32> {
-        let mut parts: Vec<_> = input.trim_start_matches('v').split('.').take(3)
-            .map(|part| part.parse::<u32>().unwrap_or(0)).collect();
-        parts.resize(3, 0);
-        parts
-    }
-    version(installed) > version(RUNTIME_VERSION)
+    matches!((distribution_version(installed), distribution_version(RUNTIME_VERSION)), (Some(a), Some(b)) if a > b)
 }
 
 fn relocate(changes: BTreeMap<PathBuf, Option<Vec<u8>>>, prefix: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
